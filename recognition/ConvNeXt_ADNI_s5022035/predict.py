@@ -7,10 +7,10 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, ConfusionMatrixDisplay
 
 from dataset import get_adni_dataloaders
-from modules import BaselineCNN, ConvNeXtTiny
+from modules import BaselineCNN, ConvNeXtTiny, build_torchvision_convnext_tiny
 
 
-def evaluate_and_autopsy(model, test_loader, device, save_dir="./results", confidence_threshold=0.7):
+def evaluate_and_autopsy(model, test_loader, device, save_dir="./results"):
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
 
@@ -95,22 +95,39 @@ def evaluate_and_autopsy(model, test_loader, device, save_dir="./results", confi
 def main():
     parser = argparse.ArgumentParser(description="Inference and Evaluation Script")
     parser.add_argument('--model', type=str, default='convnext', choices=['baseline', 'convnext'])
-    parser.add_argument('--checkpoint', type=str, default='./checkpoints/best_convnext_model.pt')
+    parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--data_dir', type=str, default='/home/groups/comp3710/ADNI/AD_NC')
+    parser.add_argument('--results_dir', type=str, default='./results',
+                        help='Directory for test plots and failure-case images')
+    parser.add_argument('--pretrained', action='store_true',
+                        help='Load the ImageNet-initialized ConvNeXt model architecture')
     args = parser.parse_args()
+
+    if args.pretrained and args.model != 'convnext':
+        parser.error('--pretrained is only supported with --model convnext')
+
+    if args.checkpoint is None:
+        if args.model == 'baseline':
+            args.checkpoint = './checkpoints/best_baseline_model.pt'
+        elif args.pretrained:
+            args.checkpoint = './checkpoints/best_convnext_pretrained_model.pt'
+        else:
+            args.checkpoint = './checkpoints/best_convnext_model.pt'
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     _, _, test_loader = get_adni_dataloaders(base_dir=args.data_dir, batch_size=32)
 
     if args.model == 'baseline':
         model = BaselineCNN(in_channels=1, num_classes=2).to(device)
+    elif args.pretrained:
+        model = build_torchvision_convnext_tiny(pretrained=False, num_classes=2).to(device)
     else:
         model = ConvNeXtTiny(in_channels=1, num_classes=2).to(device)
 
     model.load_state_dict(torch.load(args.checkpoint, map_location=device))
     print(f"Loaded weights from {args.checkpoint}")
 
-    evaluate_and_autopsy(model, test_loader, device)
+    evaluate_and_autopsy(model, test_loader, device, save_dir=args.results_dir)
 
 
 if __name__ == '__main__':

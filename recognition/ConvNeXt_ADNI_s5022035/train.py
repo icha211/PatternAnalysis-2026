@@ -7,7 +7,7 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 
 from dataset import get_adni_dataloaders
-from modules import BaselineCNN, ConvNeXtTiny
+from modules import BaselineCNN, ConvNeXtTiny, build_torchvision_convnext_tiny
 
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device):
@@ -100,7 +100,14 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
+    parser.add_argument('--pretrained', action='store_true',
+                        help='Fine-tune torchvision ConvNeXt-Tiny initialized with ImageNet weights')
+    parser.add_argument('--skip_test', action='store_true',
+                        help='Skip test-set evaluation while comparing training experiments')
     args = parser.parse_args()
+
+    if args.pretrained and args.model != 'convnext':
+        parser.error('--pretrained is only supported with --model convnext')
 
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -115,11 +122,20 @@ def main():
     if args.model == 'baseline':
         model = BaselineCNN(in_channels=1, num_classes=2).to(device)
         model_name = "BaselineCNN"
+        checkpoint_name = "best_baseline_model.pt"
     else:
-        model = ConvNeXtTiny(in_channels=1, num_classes=2).to(device)
-        model_name = "ConvNeXtTiny"
+        if args.pretrained:
+            model = build_torchvision_convnext_tiny(pretrained=True, num_classes=2).to(device)
+            model_name = "ImageNet-pretrained ConvNeXtTiny"
+            checkpoint_name = "best_convnext_pretrained_model.pt"
+        else:
+            model = ConvNeXtTiny(in_channels=1, num_classes=2).to(device)
+            model_name = "ConvNeXtTiny"
+            checkpoint_name = "best_convnext_model.pt"
 
     print(f"Initialized {model_name} (Total Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,})")
+    if args.pretrained:
+        print("ImageNet weights are used for initialization; the full model is fine-tuned.")
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
@@ -145,20 +161,26 @@ def main():
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            checkpoint_path = os.path.join(args.save_dir, f"best_{args.model}_model.pt")
+            checkpoint_path = os.path.join(args.save_dir, checkpoint_name)
             torch.save(model.state_dict(), checkpoint_path)
             print(f"  --> Saved new best checkpoint (Val Acc: {best_val_acc:.4f})")
 
     total_time = time.time() - start_time
     print(f"\nTraining completed in {total_time / 60:.2f} minutes. Best Val Acc: {best_val_acc:.4f}")
 
-    best_checkpoint = os.path.join(args.save_dir, f"best_{args.model}_model.pt")
-    model.load_state_dict(torch.load(best_checkpoint))
-    test_loss, test_acc = evaluate(model, test_loader, criterion, device)
-    print(f"\n--- Held-Out Test Evaluation ({model_name}) ---")
-    print(f"Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.4f}")
+    best_checkpoint = os.path.join(args.save_dir, checkpoint_name)
+    model.load_state_dict(torch.load(best_checkpoint, map_location=device))
+    if not args.skip_test:
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        print(f"\n--- Held-Out Test Evaluation ({model_name}) ---")
+        print(f"Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.4f}")
+    else:
+        print("\nSkipping held-out test evaluation for this experiment.")
 
-    plot_metrics(history, os.path.join(args.save_dir, f"{args.model}_training_curves.png"))
+    curve_name = f"{args.model}_training_curves.png"
+    if args.pretrained:
+        curve_name = "convnext_pretrained_training_curves.png"
+    plot_metrics(history, os.path.join(args.save_dir, curve_name))
 
 
 if __name__ == '__main__':

@@ -2,6 +2,22 @@ import torch
 import torch.nn as nn
 
 
+class DropPath(nn.Module):
+    def __init__(self, drop_probability=0.0):
+        super().__init__()
+        if not 0.0 <= drop_probability < 1.0:
+            raise ValueError("drop_probability must be in [0, 1)")
+        self.drop_probability = drop_probability
+
+    def forward(self, x):
+        if self.drop_probability == 0.0 or not self.training:
+            return x
+        keep_probability = 1.0 - self.drop_probability
+        mask_shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = x.new_empty(mask_shape).bernoulli_(keep_probability)
+        return x * mask / keep_probability
+
+
 class BaselineCNN(nn.Module):
     def __init__(self, in_channels=1, num_classes=2):
         super().__init__()
@@ -51,7 +67,7 @@ class LayerNorm2d(nn.Module):
 
 
 class ConvNeXtBlock(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, drop_path_rate=0.0):
         super().__init__()
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
         self.norm = nn.LayerNorm(dim, eps=1e-6)
@@ -61,6 +77,7 @@ class ConvNeXtBlock(nn.Module):
         self.pwconv2 = nn.Linear(4 * dim, dim)
 
         self.gamma = nn.Parameter(torch.ones(dim), requires_grad=True)
+        self.drop_path = DropPath(drop_path_rate)
         
     def forward(self, x):
         input_x = x
@@ -75,7 +92,7 @@ class ConvNeXtBlock(nn.Module):
         x = self.gamma * x
         
         x = x.permute(0, 3, 1, 2)  # NHWC -> NCHW
-        x = x + input_x
+        x = self.drop_path(x) + input_x
         return x
 
 
@@ -86,8 +103,15 @@ class ConvNeXtTiny(nn.Module):
         num_classes=2,
         depths=(3, 1, 3, 1),
         dims=(96, 192, 384, 768),
+        drop_path_rate=0.0,
+        head_dropout=0.0,
     ):
         super().__init__()
+        if not 0.0 <= head_dropout < 1.0:
+            raise ValueError("head_dropout must be in [0, 1)")
+        total_blocks = sum(depths)
+        block_drop_rates = torch.linspace(0, drop_path_rate, total_blocks).tolist()
+        next_block = 0
         self.downsample_layers = nn.ModuleList(
             [
                 nn.Sequential(
@@ -104,15 +128,19 @@ class ConvNeXtTiny(nn.Module):
                 )
             )
 
-        self.stages = nn.ModuleList(
-            [
-                nn.Sequential(
-                    *[ConvNeXtBlock(dim=dims[i]) for _ in range(depths[i])]
+        self.stages = nn.ModuleList()
+        for stage_index, depth in enumerate(depths):
+            stage_blocks = [
+                ConvNeXtBlock(
+                    dim=dims[stage_index],
+                    drop_path_rate=block_drop_rates[next_block + block_index],
                 )
-                for i in range(4)
+                for block_index in range(depth)
             ]
-        )
+            self.stages.append(nn.Sequential(*stage_blocks))
+            next_block += depth
         self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
+        self.head_dropout = nn.Dropout(head_dropout)
         self.head = nn.Linear(dims[-1], num_classes)
 
     def forward(self, x):
@@ -122,6 +150,7 @@ class ConvNeXtTiny(nn.Module):
 
         x = x.mean([-2, -1])
         x = self.norm(x)
+        x = self.head_dropout(x)
         return self.head(x)
 
 

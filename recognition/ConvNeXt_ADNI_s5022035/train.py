@@ -162,6 +162,10 @@ def main():
                         help='Stop after this many epochs without validation-accuracy improvement; 0 disables')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--num_workers', type=int, default=1, help='DataLoader worker count')
+    parser.add_argument('--drop_path_rate', type=float, default=0.0,
+                        help='Maximum stochastic-depth rate for scratch ConvNeXt')
+    parser.add_argument('--head_dropout', type=float, default=0.0,
+                        help='Classifier dropout for scratch ConvNeXt')
     parser.add_argument(
         '--patient_balanced_sampling',
         action='store_true',
@@ -187,6 +191,12 @@ def main():
         parser.error('--label_smoothing must be in [0, 1)')
     if args.patience < 0:
         parser.error('--patience must be non-negative')
+    if not 0.0 <= args.drop_path_rate < 1.0:
+        parser.error('--drop_path_rate must be in [0, 1)')
+    if not 0.0 <= args.head_dropout < 1.0:
+        parser.error('--head_dropout must be in [0, 1)')
+    if args.pretrained and (args.drop_path_rate or args.head_dropout):
+        parser.error('--drop_path_rate and --head_dropout apply only to scratch ConvNeXt')
 
     os.makedirs(args.save_dir, exist_ok=True)
     seed_everything(args.seed)
@@ -218,7 +228,12 @@ def main():
             model_name = "ImageNet-pretrained ConvNeXtTiny"
             checkpoint_name = "best_convnext_pretrained_model.pt"
         else:
-            model = ConvNeXtTiny(in_channels=1, num_classes=2).to(device)
+            model = ConvNeXtTiny(
+                in_channels=1,
+                num_classes=2,
+                drop_path_rate=args.drop_path_rate,
+                head_dropout=args.head_dropout,
+            ).to(device)
             model_name = "ConvNeXtTiny"
             checkpoint_name = "best_convnext_model.pt"
 

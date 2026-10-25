@@ -9,9 +9,10 @@ from sklearn.model_selection import train_test_split
 
 
 class ADNIDataset(Dataset):
-    def __init__(self, file_paths, labels, transform=None):
+    def __init__(self, file_paths, labels, patient_ids, transform=None):
         self.file_paths = file_paths
         self.labels = labels
+        self.patient_ids = patient_ids
         self.transform = transform
 
     def __len__(self):
@@ -98,17 +99,18 @@ def get_adni_dataloaders(
     )
     
     def assemble_paths(patient_files, pids):
-        paths, labels = [], []
+        paths, labels, patient_ids = [], [], []
         for pid in pids:
             for path, label in patient_files[pid]["files"]:
                 paths.append(path)
                 labels.append(label)
-        return paths, labels
+                patient_ids.append(pid)
+        return paths, labels, patient_ids
 
-    tr_paths, tr_labels = assemble_paths(train_patient_files, tr_pids)
-    val_paths, val_labels = assemble_paths(train_patient_files, val_pids)
+    tr_paths, tr_labels, tr_patient_ids = assemble_paths(train_patient_files, tr_pids)
+    val_paths, val_labels, val_patient_ids = assemble_paths(train_patient_files, val_pids)
     test_pids = list(test_patient_files.keys())
-    test_paths, test_labels = assemble_paths(test_patient_files, test_pids)
+    test_paths, test_labels, test_patient_ids = assemble_paths(test_patient_files, test_pids)
 
     train_transform = transforms.Compose([
         transforms.Resize((img_size, img_size)),
@@ -123,9 +125,15 @@ def get_adni_dataloaders(
         transforms.Normalize(mean=[0.5], std=[0.5])
     ])
 
-    train_dataset = ADNIDataset(tr_paths, tr_labels, transform=train_transform)
-    val_dataset = ADNIDataset(val_paths, val_labels, transform=eval_transform)
-    test_dataset = ADNIDataset(test_paths, test_labels, transform=eval_transform)
+    train_dataset = ADNIDataset(
+        tr_paths, tr_labels, tr_patient_ids, transform=train_transform
+    )
+    val_dataset = ADNIDataset(
+        val_paths, val_labels, val_patient_ids, transform=eval_transform
+    )
+    test_dataset = ADNIDataset(
+        test_paths, test_labels, test_patient_ids, transform=eval_transform
+    )
 
     generator = torch.Generator()
     generator.manual_seed(random_state)

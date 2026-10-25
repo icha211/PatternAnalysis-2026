@@ -6,9 +6,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import matplotlib.pyplot as plt
 
-from dataset import get_adni_dataloaders
+from dataset import get_adni_dataloaders, seed_data_worker
 from modules import BaselineCNN, ConvNeXtTiny, build_torchvision_convnext_tiny
 
 
@@ -102,6 +103,50 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def patient_balanced_sample_weights(dataset):
+    patient_labels = {}
+    patient_counts = {}
+    for patient_id, label in zip(dataset.patient_ids, dataset.labels):
+        if patient_id in patient_labels and patient_labels[patient_id] != label:
+            raise ValueError(f"Patient {patient_id!r} has conflicting training labels")
+        patient_labels[patient_id] = label
+        patient_counts[patient_id] = patient_counts.get(patient_id, 0) + 1
+
+    patients_per_class = {}
+    for patient_id, label in patient_labels.items():
+        patients_per_class.setdefault(label, set()).add(patient_id)
+
+    weights = []
+    for patient_id, label in zip(dataset.patient_ids, dataset.labels):
+        class_patient_count = len(patients_per_class[label])
+        weights.append(
+            1.0 / (len(patients_per_class) * class_patient_count * patient_counts[patient_id])
+        )
+    return torch.as_tensor(weights, dtype=torch.double)
+
+
+def print_split_summary(name, dataset):
+    image_counts = {label: dataset.labels.count(label) for label in sorted(set(dataset.labels))}
+    patient_labels = {}
+    images_per_patient = {}
+    for patient_id, label in zip(dataset.patient_ids, dataset.labels):
+        if patient_id in patient_labels and patient_labels[patient_id] != label:
+            raise ValueError(f"Patient {patient_id!r} has conflicting labels in {name} split")
+        patient_labels[patient_id] = label
+        images_per_patient[patient_id] = images_per_patient.get(patient_id, 0) + 1
+    patient_counts = {
+        label: sum(patient_label == label for patient_label in patient_labels.values())
+        for label in sorted(set(patient_labels.values()))
+    }
+    slice_counts = sorted(images_per_patient.values())
+    median_slices = slice_counts[len(slice_counts) // 2] if slice_counts else 0
+    print(
+        f"{name}: images/class={image_counts}, patients/class={patient_counts}, "
+        f"images/patient min/median/max="
+        f"{(slice_counts[0], median_slices, slice_counts[-1]) if slice_counts else (0, 0, 0)}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Baseline or ConvNeXt model on ADNI dataset")
     parser.add_argument('--model', type=str, default='convnext', choices=['baseline', 'convnext'], help='Model architecture')
@@ -117,11 +162,23 @@ def main():
                         help='Stop after this many epochs without validation-accuracy improvement; 0 disables')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--num_workers', type=int, default=1, help='DataLoader worker count')
+    parser.add_argument(
+        '--patient_balanced_sampling',
+        action='store_true',
+        help='Sample classes equally and patients equally within each class',
+    )
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
     parser.add_argument('--pretrained', action='store_true',
                         help='Fine-tune torchvision ConvNeXt-Tiny initialized with ImageNet weights')
     parser.add_argument('--skip_test', action='store_true',
                         help='Skip test-set evaluation while comparing training experiments')
+    parser.set_defaults(skip_test=True)
+    parser.add_argument(
+        '--evaluate_test',
+        dest='skip_test',
+        action='store_false',
+        help='Explicitly evaluate the test set after training (prefer predict.py for final reporting)',
+    )
     args = parser.parse_args()
 
     if args.pretrained and args.model != 'convnext':
@@ -148,6 +205,8 @@ def main():
         f"validation={len(val_loader.dataset):,} images, "
         f"test={len(test_loader.dataset):,} images"
     )
+    print_split_summary("Train", train_loader.dataset)
+    print_split_summary("Validation", val_loader.dataset)
 
     if args.model == 'baseline':
         model = BaselineCNN(in_channels=1, num_classes=2).to(device)
@@ -169,6 +228,22 @@ def main():
 
     train_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     eval_criterion = nn.CrossEntropyLoss()
+    if args.patient_balanced_sampling:
+        sampler = WeightedRandomSampler(
+            patient_balanced_sample_weights(train_loader.dataset),
+            num_samples=len(train_loader.dataset),
+            replacement=True,
+            generator=torch.Generator().manual_seed(args.seed),
+        )
+        train_loader = DataLoader(
+            train_loader.dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            worker_init_fn=seed_data_worker,
+            generator=torch.Generator().manual_seed(args.seed),
+        )
+        print("Using class- and patient-balanced sampling.")
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 

@@ -1,6 +1,8 @@
 import os
 import argparse
+import random
 import time
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -92,6 +94,14 @@ def plot_metrics(history, save_path):
     print(f"Metrics plot saved to {save_path}")
 
 
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Baseline or ConvNeXt model on ADNI dataset")
     parser.add_argument('--model', type=str, default='convnext', choices=['baseline', 'convnext'], help='Model architecture')
@@ -99,6 +109,14 @@ def main():
     parser.add_argument('--epochs', type=int, default=15, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.05,
+                        help='AdamW weight decay for regularization')
+    parser.add_argument('--label_smoothing', type=float, default=0.05,
+                        help='Cross-entropy label smoothing in [0, 1)')
+    parser.add_argument('--patience', type=int, default=6,
+                        help='Stop after this many epochs without validation-accuracy improvement; 0 disables')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--num_workers', type=int, default=1, help='DataLoader worker count')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
     parser.add_argument('--pretrained', action='store_true',
                         help='Fine-tune torchvision ConvNeXt-Tiny initialized with ImageNet weights')
@@ -108,15 +126,27 @@ def main():
 
     if args.pretrained and args.model != 'convnext':
         parser.error('--pretrained is only supported with --model convnext')
+    if not 0.0 <= args.label_smoothing < 1.0:
+        parser.error('--label_smoothing must be in [0, 1)')
+    if args.patience < 0:
+        parser.error('--patience must be non-negative')
 
     os.makedirs(args.save_dir, exist_ok=True)
+    seed_everything(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
     # 1. Load 
     train_loader, val_loader, test_loader = get_adni_dataloaders(
         base_dir=args.data_dir,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        random_state=args.seed,
+        num_workers=args.num_workers,
+    )
+    print(
+        f"Patient-grouped split sizes: train={len(train_loader.dataset):,} images, "
+        f"validation={len(val_loader.dataset):,} images, "
+        f"test={len(test_loader.dataset):,} images"
     )
 
     if args.model == 'baseline':
@@ -137,17 +167,22 @@ def main():
     if args.pretrained:
         print("ImageNet weights are used for initialization; the full model is fine-tuned.")
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+    train_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    eval_criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    best_val_acc = 0.0
+    best_val_acc = float('-inf')
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
     start_time = time.time()
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, train_criterion, optimizer, device
+        )
+        val_loss, val_acc = evaluate(model, val_loader, eval_criterion, device)
         scheduler.step()
 
         history['train_loss'].append(train_loss)
@@ -161,9 +196,23 @@ def main():
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
             checkpoint_path = os.path.join(args.save_dir, checkpoint_name)
             torch.save(model.state_dict(), checkpoint_path)
-            print(f"  --> Saved new best checkpoint (Val Acc: {best_val_acc:.4f})")
+            print(
+                f"  --> Saved new best checkpoint "
+                f"(Val Acc: {best_val_acc:.4f}, Val Loss: {best_val_loss:.4f})"
+            )
+        else:
+            epochs_without_improvement += 1
+
+        if args.patience and epochs_without_improvement >= args.patience:
+            print(
+                f"Early stopping after {epoch} epochs; validation accuracy did not "
+                f"improve for {args.patience} consecutive epochs."
+            )
+            break
 
     total_time = time.time() - start_time
     print(f"\nTraining completed in {total_time / 60:.2f} minutes. Best Val Acc: {best_val_acc:.4f}")
@@ -171,7 +220,7 @@ def main():
     best_checkpoint = os.path.join(args.save_dir, checkpoint_name)
     model.load_state_dict(torch.load(best_checkpoint, map_location=device))
     if not args.skip_test:
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        test_loss, test_acc = evaluate(model, test_loader, eval_criterion, device)
         print(f"\n--- Held-Out Test Evaluation ({model_name}) ---")
         print(f"Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.4f}")
     else:

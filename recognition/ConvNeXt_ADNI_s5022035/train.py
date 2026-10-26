@@ -166,6 +166,8 @@ def main():
                         help='Maximum stochastic-depth rate for scratch ConvNeXt')
     parser.add_argument('--head_dropout', type=float, default=0.0,
                         help='Classifier dropout for scratch ConvNeXt')
+    parser.add_argument('--layer_scale_init', type=float, default=1e-6,
+                        help='Initial residual layer scale for scratch ConvNeXt')
     parser.add_argument(
         '--patient_balanced_sampling',
         action='store_true',
@@ -195,6 +197,8 @@ def main():
         parser.error('--drop_path_rate must be in [0, 1)')
     if not 0.0 <= args.head_dropout < 1.0:
         parser.error('--head_dropout must be in [0, 1)')
+    if args.layer_scale_init < 0.0:
+        parser.error('--layer_scale_init must be non-negative')
     if args.pretrained and (args.drop_path_rate or args.head_dropout):
         parser.error('--drop_path_rate and --head_dropout apply only to scratch ConvNeXt')
 
@@ -233,6 +237,7 @@ def main():
                 num_classes=2,
                 drop_path_rate=args.drop_path_rate,
                 head_dropout=args.head_dropout,
+                layer_scale_init=args.layer_scale_init,
             ).to(device)
             model_name = "ConvNeXtTiny"
             checkpoint_name = "best_convnext_model.pt"

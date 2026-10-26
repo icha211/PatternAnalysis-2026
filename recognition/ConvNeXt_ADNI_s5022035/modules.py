@@ -105,10 +105,13 @@ class ConvNeXtTiny(nn.Module):
         dims=(96, 192, 384, 768),
         drop_path_rate=0.0,
         head_dropout=0.0,
+        layer_scale_init=1e-6,
     ):
         super().__init__()
         if not 0.0 <= head_dropout < 1.0:
             raise ValueError("head_dropout must be in [0, 1)")
+        if layer_scale_init < 0.0:
+            raise ValueError("layer_scale_init must be non-negative")
         total_blocks = sum(depths)
         block_drop_rates = torch.linspace(0, drop_path_rate, total_blocks).tolist()
         next_block = 0
@@ -137,6 +140,8 @@ class ConvNeXtTiny(nn.Module):
                 )
                 for block_index in range(depth)
             ]
+            for block in stage_blocks:
+                nn.init.constant_(block.gamma, layer_scale_init)
             self.stages.append(nn.Sequential(*stage_blocks))
             next_block += depth
         self.norm = nn.LayerNorm(dims[-1], eps=1e-6)

@@ -2,6 +2,12 @@ import torch
 import torch.nn as nn
 
 
+CONVNEXT_CONFIGS = {
+    "tiny": ((3, 1, 3, 1), (96, 192, 384, 768)),
+    "compact": ((2, 2, 6, 2), (40, 80, 160, 320)),
+}
+
+
 class DropPath(nn.Module):
     def __init__(self, drop_probability=0.0):
         super().__init__()
@@ -101,17 +107,30 @@ class ConvNeXtTiny(nn.Module):
         self,
         in_channels=1,
         num_classes=2,
-        depths=(3, 1, 3, 1),
-        dims=(96, 192, 384, 768),
+        depths=None,
+        dims=None,
         drop_path_rate=0.0,
         head_dropout=0.0,
         layer_scale_init=1e-6,
+        variant="tiny",
     ):
         super().__init__()
+        if variant not in CONVNEXT_CONFIGS:
+            raise ValueError(
+                f"Unsupported ConvNeXt variant {variant!r}; "
+                f"choose from {', '.join(CONVNEXT_CONFIGS)}"
+            )
         if not 0.0 <= head_dropout < 1.0:
             raise ValueError("head_dropout must be in [0, 1)")
         if layer_scale_init < 0.0:
             raise ValueError("layer_scale_init must be non-negative")
+        default_depths, default_dims = CONVNEXT_CONFIGS[variant]
+        depths = default_depths if depths is None else depths
+        dims = default_dims if dims is None else dims
+        if len(depths) != 4 or len(dims) != 4:
+            raise ValueError("ConvNeXt depths and dims must each contain four stages")
+        if any(depth <= 0 for depth in depths) or any(dim <= 0 for dim in dims):
+            raise ValueError("ConvNeXt depths and dims must contain positive integers")
         total_blocks = sum(depths)
         block_drop_rates = torch.linspace(0, drop_path_rate, total_blocks).tolist()
         next_block = 0

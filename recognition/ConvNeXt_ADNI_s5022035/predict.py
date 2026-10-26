@@ -2,35 +2,16 @@ import os
 import argparse
 import torch
 import torch.nn.functional as F
-import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, ConfusionMatrixDisplay
 
 from dataset import get_adni_dataloaders
-from modules import BaselineCNN, ConvNeXtTiny, build_torchvision_convnext_tiny
-
-
-def aggregate_patient_predictions(patient_ids, probabilities, labels):
-    if not (len(patient_ids) == len(probabilities) == len(labels)):
-        raise ValueError("Patient IDs, probabilities, and labels must have equal lengths")
-
-    patient_probabilities = {}
-    patient_labels = {}
-    for patient_id, probability, label in zip(patient_ids, probabilities, labels):
-        if patient_id in patient_labels and patient_labels[patient_id] != label:
-            raise ValueError(f"Patient {patient_id!r} has inconsistent labels")
-        patient_labels[patient_id] = label
-        patient_probabilities.setdefault(patient_id, []).append(probability)
-
-    ordered_ids = sorted(patient_probabilities)
-    return (
-        ordered_ids,
-        [patient_labels[patient_id] for patient_id in ordered_ids],
-        [
-            float(np.mean(patient_probabilities[patient_id]))
-            for patient_id in ordered_ids
-        ],
-    )
+from modules import (
+    CONVNEXT_CONFIGS,
+    BaselineCNN,
+    ConvNeXtTiny,
+    build_torchvision_convnext_tiny,
+)
 
 
 def evaluate_and_autopsy(model, test_loader, device, save_dir="./results"):
@@ -56,8 +37,8 @@ def evaluate_and_autopsy(model, test_loader, device, save_dir="./results"):
                 pred = preds[i].item()
                 label = labels[i].item()
 
-                all_probs.append(prob_ad)
                 all_preds.append(pred)
+                all_probs.append(prob_ad)
                 all_labels.append(label)
 
                 if pred != label:
@@ -81,28 +62,16 @@ def evaluate_and_autopsy(model, test_loader, device, save_dir="./results"):
                         failure_cases[error_type] = failure_cases[error_type][:3]
             image_offset += images.size(0)
 
-    print("\n================ Classification Report ================")
+    print("\n================ Slice-Level Classification Report ================")
     print(classification_report(all_labels, all_preds, target_names=['NC', 'AD'], digits=4))
-    
-    auroc = roc_auc_score(all_labels, all_probs)
-    print(f"Test AUROC Score: {auroc:.4f}")
 
-    patient_ids, patient_labels, patient_probs = aggregate_patient_predictions(
-        patient_ids, all_probs, all_labels
-    )
-    patient_preds = [int(probability >= 0.5) for probability in patient_probs]
-    print("\n================ Patient-Level Metrics (mean slice probability) ================")
+    correct_slices = sum(pred == label for pred, label in zip(all_preds, all_labels))
+    total_slices = len(all_labels)
     print(
-        classification_report(
-            patient_labels,
-            patient_preds,
-            labels=[0, 1],
-            target_names=['NC', 'AD'],
-            digits=4,
-            zero_division=0,
-        )
+        f"Slice accuracy: {correct_slices}/{total_slices} "
+        f"= {correct_slices / total_slices:.4f}"
     )
-    print(f"Patient-level AUROC: {roc_auc_score(patient_labels, patient_probs):.4f}")
+    print(f"Slice-level AUROC: {roc_auc_score(all_labels, all_probs):.4f}")
 
     # 2. Confusion Matrix Plot
     cm = confusion_matrix(all_labels, all_preds)
@@ -133,34 +102,17 @@ def evaluate_and_autopsy(model, test_loader, device, save_dir="./results"):
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, "failure_case_autopsy.png"))
         plt.close()
-        print(
-            f"Saved up to three high-confidence false positives and false negatives "
-            f"to {os.path.join(save_dir, 'failure_case_autopsy.png')}"
-        )
-
-    ambiguous_count = 0
-    automated_correct = 0
-    automated_total = 0
-
-    for prob, pred, label in zip(all_probs, all_preds, all_labels):
-        if 0.35 <= prob <= 0.65:
-            ambiguous_count += 1
-        else:
-            automated_total += 1
-            if pred == label:
-                automated_correct += 1
-
-    auto_acc = automated_correct / automated_total if automated_total > 0 else 0
-    print(f"\n================ Operational Triage Policy Simulation ================")
-    print(f"Total Test Cases     : {len(all_labels)}")
-    print(f"Automated Cases      : {automated_total} ({automated_total / len(all_labels) * 100:.1f}%)")
-    print(f"Routed to Human      : {ambiguous_count} ({ambiguous_count / len(all_labels) * 100:.1f}%)")
-    print(f"Automated Sub-System Accuracy: {auto_acc * 100:.2f}%")
-
 
 def main():
     parser = argparse.ArgumentParser(description="Inference and Evaluation Script")
     parser.add_argument('--model', type=str, default='convnext', choices=['baseline', 'convnext'])
+    parser.add_argument(
+        '--convnext_variant',
+        type=str,
+        default='tiny',
+        choices=sorted(CONVNEXT_CONFIGS),
+        help='Custom ConvNeXt configuration matching the checkpoint',
+    )
     parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--data_dir', type=str, default='/home/groups/comp3710/ADNI/AD_NC')
     parser.add_argument('--results_dir', type=str, default='./results',
@@ -171,6 +123,8 @@ def main():
 
     if args.pretrained and args.model != 'convnext':
         parser.error('--pretrained is only supported with --model convnext')
+    if args.pretrained and args.convnext_variant != 'tiny':
+        parser.error('--convnext_variant compact is only supported for scratch checkpoints')
 
     if args.checkpoint is None:
         if args.model == 'baseline':
@@ -188,10 +142,12 @@ def main():
     elif args.pretrained:
         model = build_torchvision_convnext_tiny(pretrained=False, num_classes=2).to(device)
     else:
-        model = ConvNeXtTiny(in_channels=1, num_classes=2).to(device)
-
+        model = ConvNeXtTiny(
+            in_channels=1,
+            num_classes=2,
+            variant=args.convnext_variant,
+        ).to(device)
     model.load_state_dict(torch.load(args.checkpoint, map_location=device))
-    print(f"Loaded weights from {args.checkpoint}")
 
     evaluate_and_autopsy(model, test_loader, device, save_dir=args.results_dir)
 

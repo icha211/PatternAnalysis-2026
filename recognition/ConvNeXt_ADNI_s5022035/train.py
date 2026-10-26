@@ -10,7 +10,12 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 import matplotlib.pyplot as plt
 
 from dataset import get_adni_dataloaders, seed_data_worker
-from modules import BaselineCNN, ConvNeXtTiny, build_torchvision_convnext_tiny
+from modules import (
+    CONVNEXT_CONFIGS,
+    BaselineCNN,
+    ConvNeXtTiny,
+    build_torchvision_convnext_tiny,
+)
 
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device):
@@ -92,7 +97,6 @@ def plot_metrics(history, save_path):
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
-    print(f"Metrics plot saved to {save_path}")
 
 
 def seed_everything(seed):
@@ -125,31 +129,16 @@ def patient_balanced_sample_weights(dataset):
     return torch.as_tensor(weights, dtype=torch.double)
 
 
-def print_split_summary(name, dataset):
-    image_counts = {label: dataset.labels.count(label) for label in sorted(set(dataset.labels))}
-    patient_labels = {}
-    images_per_patient = {}
-    for patient_id, label in zip(dataset.patient_ids, dataset.labels):
-        if patient_id in patient_labels and patient_labels[patient_id] != label:
-            raise ValueError(f"Patient {patient_id!r} has conflicting labels in {name} split")
-        patient_labels[patient_id] = label
-        images_per_patient[patient_id] = images_per_patient.get(patient_id, 0) + 1
-    patient_counts = {
-        label: sum(patient_label == label for patient_label in patient_labels.values())
-        for label in sorted(set(patient_labels.values()))
-    }
-    slice_counts = sorted(images_per_patient.values())
-    median_slices = slice_counts[len(slice_counts) // 2] if slice_counts else 0
-    print(
-        f"{name}: images/class={image_counts}, patients/class={patient_counts}, "
-        f"images/patient min/median/max="
-        f"{(slice_counts[0], median_slices, slice_counts[-1]) if slice_counts else (0, 0, 0)}"
-    )
-
-
 def main():
     parser = argparse.ArgumentParser(description="Train Baseline or ConvNeXt model on ADNI dataset")
     parser.add_argument('--model', type=str, default='convnext', choices=['baseline', 'convnext'], help='Model architecture')
+    parser.add_argument(
+        '--convnext_variant',
+        type=str,
+        default='tiny',
+        choices=sorted(CONVNEXT_CONFIGS),
+        help='Custom ConvNeXt configuration to use for scratch training',
+    )
     parser.add_argument('--data_dir', type=str, default='/home/groups/comp3710/ADNI/AD_NC', help='ADNI dataset directory')
     parser.add_argument('--epochs', type=int, default=15, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
@@ -189,6 +178,8 @@ def main():
 
     if args.pretrained and args.model != 'convnext':
         parser.error('--pretrained is only supported with --model convnext')
+    if args.pretrained and args.convnext_variant != 'tiny':
+        parser.error('--convnext_variant compact is only supported for scratch training')
     if not 0.0 <= args.label_smoothing < 1.0:
         parser.error('--label_smoothing must be in [0, 1)')
     if args.patience < 0:
@@ -205,31 +196,20 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     seed_everything(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
 
-    # 1. Load 
     train_loader, val_loader, test_loader = get_adni_dataloaders(
         base_dir=args.data_dir,
         batch_size=args.batch_size,
         random_state=args.seed,
         num_workers=args.num_workers,
     )
-    print(
-        f"Patient-grouped split sizes: train={len(train_loader.dataset):,} images, "
-        f"validation={len(val_loader.dataset):,} images, "
-        f"test={len(test_loader.dataset):,} images"
-    )
-    print_split_summary("Train", train_loader.dataset)
-    print_split_summary("Validation", val_loader.dataset)
 
     if args.model == 'baseline':
         model = BaselineCNN(in_channels=1, num_classes=2).to(device)
-        model_name = "BaselineCNN"
         checkpoint_name = "best_baseline_model.pt"
     else:
         if args.pretrained:
             model = build_torchvision_convnext_tiny(pretrained=True, num_classes=2).to(device)
-            model_name = "ImageNet-pretrained ConvNeXtTiny"
             checkpoint_name = "best_convnext_pretrained_model.pt"
         else:
             model = ConvNeXtTiny(
@@ -238,13 +218,13 @@ def main():
                 drop_path_rate=args.drop_path_rate,
                 head_dropout=args.head_dropout,
                 layer_scale_init=args.layer_scale_init,
+                variant=args.convnext_variant,
             ).to(device)
-            model_name = "ConvNeXtTiny"
-            checkpoint_name = "best_convnext_model.pt"
-
-    print(f"Initialized {model_name} (Total Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,})")
-    if args.pretrained:
-        print("ImageNet weights are used for initialization; the full model is fine-tuned.")
+            checkpoint_name = (
+                "best_convnext_compact_model.pt"
+                if args.convnext_variant == "compact"
+                else "best_convnext_model.pt"
+            )
 
     train_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     eval_criterion = nn.CrossEntropyLoss()
@@ -263,12 +243,10 @@ def main():
             worker_init_fn=seed_data_worker,
             generator=torch.Generator().manual_seed(args.seed),
         )
-        print("Using class- and patient-balanced sampling.")
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     best_val_acc = float('-inf')
-    best_val_loss = float('inf')
     epochs_without_improvement = 0
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
     start_time = time.time()
@@ -291,22 +269,13 @@ def main():
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_val_loss = val_loss
             epochs_without_improvement = 0
             checkpoint_path = os.path.join(args.save_dir, checkpoint_name)
             torch.save(model.state_dict(), checkpoint_path)
-            print(
-                f"  --> Saved new best checkpoint "
-                f"(Val Acc: {best_val_acc:.4f}, Val Loss: {best_val_loss:.4f})"
-            )
         else:
             epochs_without_improvement += 1
 
         if args.patience and epochs_without_improvement >= args.patience:
-            print(
-                f"Early stopping after {epoch} epochs; validation accuracy did not "
-                f"improve for {args.patience} consecutive epochs."
-            )
             break
 
     total_time = time.time() - start_time
@@ -316,12 +285,13 @@ def main():
     model.load_state_dict(torch.load(best_checkpoint, map_location=device))
     if not args.skip_test:
         test_loss, test_acc = evaluate(model, test_loader, eval_criterion, device)
-        print(f"\n--- Held-Out Test Evaluation ({model_name}) ---")
         print(f"Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.4f}")
-    else:
-        print("\nSkipping held-out test evaluation for this experiment.")
 
-    curve_name = f"{args.model}_training_curves.png"
+    curve_name = (
+        f"convnext_{args.convnext_variant}_training_curves.png"
+        if args.model == 'convnext' and not args.pretrained
+        else f"{args.model}_training_curves.png"
+    )
     if args.pretrained:
         curve_name = "convnext_pretrained_training_curves.png"
     plot_metrics(history, os.path.join(args.save_dir, curve_name))

@@ -3,14 +3,13 @@ import argparse
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
 
 from dataset import get_adni_dataloaders
 from modules import (
     CONVNEXT_CONFIGS,
     BaselineCNN,
     ConvNeXtTiny,
-    build_torchvision_convnext_tiny,
 )
 
 
@@ -19,7 +18,6 @@ def evaluate_and_autopsy(model, test_loader, device, save_dir="./results"):
     model.eval()
 
     all_preds = []
-    all_probs = []
     all_labels = []
     failure_cases = {"false_positive": [], "false_negative": []}
     patient_ids = test_loader.dataset.patient_ids
@@ -38,7 +36,6 @@ def evaluate_and_autopsy(model, test_loader, device, save_dir="./results"):
                 label = labels[i].item()
 
                 all_preds.append(pred)
-                all_probs.append(prob_ad)
                 all_labels.append(label)
 
                 if pred != label:
@@ -62,16 +59,7 @@ def evaluate_and_autopsy(model, test_loader, device, save_dir="./results"):
                         failure_cases[error_type] = failure_cases[error_type][:3]
             image_offset += images.size(0)
 
-    print("\n================ Slice-Level Classification Report ================")
     print(classification_report(all_labels, all_preds, target_names=['NC', 'AD'], digits=4))
-
-    correct_slices = sum(pred == label for pred, label in zip(all_preds, all_labels))
-    total_slices = len(all_labels)
-    print(
-        f"Slice accuracy: {correct_slices}/{total_slices} "
-        f"= {correct_slices / total_slices:.4f}"
-    )
-    print(f"Slice-level AUROC: {roc_auc_score(all_labels, all_probs):.4f}")
 
     # 2. Confusion Matrix Plot
     cm = confusion_matrix(all_labels, all_preds)
@@ -117,20 +105,11 @@ def main():
     parser.add_argument('--data_dir', type=str, default='/home/groups/comp3710/ADNI/AD_NC')
     parser.add_argument('--results_dir', type=str, default='./results',
                         help='Directory for test plots and failure-case images')
-    parser.add_argument('--pretrained', action='store_true',
-                        help='Load the ImageNet-initialized ConvNeXt model architecture')
     args = parser.parse_args()
-
-    if args.pretrained and args.model != 'convnext':
-        parser.error('--pretrained is only supported with --model convnext')
-    if args.pretrained and args.convnext_variant != 'tiny':
-        parser.error('--convnext_variant compact is only supported for scratch checkpoints')
 
     if args.checkpoint is None:
         if args.model == 'baseline':
             args.checkpoint = './checkpoints/best_baseline_model.pt'
-        elif args.pretrained:
-            args.checkpoint = './checkpoints/best_convnext_pretrained_model.pt'
         else:
             args.checkpoint = './checkpoints/best_convnext_model.pt'
 
@@ -139,8 +118,6 @@ def main():
 
     if args.model == 'baseline':
         model = BaselineCNN(in_channels=1, num_classes=2).to(device)
-    elif args.pretrained:
-        model = build_torchvision_convnext_tiny(pretrained=False, num_classes=2).to(device)
     else:
         model = ConvNeXtTiny(
             in_channels=1,

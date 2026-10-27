@@ -31,7 +31,13 @@ class ADNIDataset(Dataset):
 
 def extract_patient_id(file_path):
     filename = os.path.basename(file_path)
-    return filename.split('_')[0]
+    stem, _ = os.path.splitext(filename)
+    parts = stem.split('_')
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        raise ValueError(
+            f"Expected an image filename in patient_slice format, got {filename!r}"
+        )
+    return parts[0]
 
 
 def load_split_files(split_dir):
@@ -44,6 +50,7 @@ def load_split_files(split_dir):
             raise FileNotFoundError(f"Expected class directory does not exist: {class_dir}")
         for filename in sorted(os.listdir(class_dir)):
             if filename.lower().endswith((".png", ".jpg", ".jpeg")):
+                file_path = os.path.join(class_dir, filename)
                 patient_id = extract_patient_id(filename)
                 if patient_id not in patient_files:
                     patient_files[patient_id] = {"label": label, "files": []}
@@ -52,9 +59,7 @@ def load_split_files(split_dir):
                         f"Patient ID {patient_id!r} has files in both classes under {split_dir}. "
                         "Resolve longitudinal or conflicting labels before training."
                     )
-                patient_files[patient_id]["files"].append(
-                    (os.path.join(class_dir, filename), label)
-                )
+                patient_files[patient_id]["files"].append((file_path, label))
     if not patient_files:
         raise ValueError(f"No supported images found under {split_dir}")
     return patient_files
@@ -82,35 +87,41 @@ def get_adni_dataloaders(
 
     overlapping_patients = set(train_patient_files).intersection(test_patient_files)
     if overlapping_patients:
-        examples = ", ".join(sorted(overlapping_patients)[:5])
         raise ValueError(
             f"Patient-level leakage detected: {len(overlapping_patients)} patient IDs "
-            f"occur in both train and test (examples: {examples})."
+            f"occur in both train and test (examples: "
+            f"{', '.join(sorted(overlapping_patients)[:5])})."
         )
     
-    train_pids = list(train_patient_files.keys())
-    train_labels = [train_patient_files[pid]["label"] for pid in train_pids]
+    train_patient_ids = list(train_patient_files.keys())
+    train_labels = [train_patient_files[patient_id]["label"] for patient_id in train_patient_ids]
     
-    tr_pids, val_pids = train_test_split(
-        train_pids,
+    tr_patient_ids, val_patient_ids = train_test_split(
+        train_patient_ids,
         test_size=val_ratio,
         random_state=random_state,
         stratify=train_labels
     )
     
-    def assemble_paths(patient_files, pids):
-        paths, labels, patient_ids = [], [], []
-        for pid in pids:
-            for path, label in patient_files[pid]["files"]:
+    def assemble_paths(patient_files, patient_ids):
+        paths, labels, assembled_patient_ids = [], [], []
+        for patient_id in patient_ids:
+            for path, label in patient_files[patient_id]["files"]:
                 paths.append(path)
                 labels.append(label)
-                patient_ids.append(pid)
-        return paths, labels, patient_ids
+                assembled_patient_ids.append(patient_id)
+        return paths, labels, assembled_patient_ids
 
-    tr_paths, tr_labels, tr_patient_ids = assemble_paths(train_patient_files, tr_pids)
-    val_paths, val_labels, val_patient_ids = assemble_paths(train_patient_files, val_pids)
-    test_pids = list(test_patient_files.keys())
-    test_paths, test_labels, test_patient_ids = assemble_paths(test_patient_files, test_pids)
+    tr_paths, tr_labels, tr_patient_ids = assemble_paths(
+        train_patient_files, tr_patient_ids
+    )
+    val_paths, val_labels, val_patient_ids = assemble_paths(
+        train_patient_files, val_patient_ids
+    )
+    test_patient_ids = list(test_patient_files.keys())
+    test_paths, test_labels, test_patient_ids = assemble_paths(
+        test_patient_files, test_patient_ids
+    )
 
     train_transform = transforms.Compose([
         transforms.Resize((img_size, img_size)),

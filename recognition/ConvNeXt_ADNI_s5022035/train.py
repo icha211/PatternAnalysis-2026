@@ -14,7 +14,6 @@ from modules import (
     CONVNEXT_CONFIGS,
     BaselineCNN,
     ConvNeXtTiny,
-    build_torchvision_convnext_tiny,
 )
 
 
@@ -124,7 +123,11 @@ def patient_balanced_sample_weights(dataset):
     for patient_id, label in zip(dataset.patient_ids, dataset.labels):
         class_patient_count = len(patients_per_class[label])
         weights.append(
-            1.0 / (len(patients_per_class) * class_patient_count * patient_counts[patient_id])
+            1.0 / (
+                len(patients_per_class)
+                * class_patient_count
+                * patient_counts[patient_id]
+            )
         )
     return torch.as_tensor(weights, dtype=torch.double)
 
@@ -163,8 +166,6 @@ def main():
         help='Sample classes equally and patients equally within each class',
     )
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
-    parser.add_argument('--pretrained', action='store_true',
-                        help='Fine-tune torchvision ConvNeXt-Tiny initialized with ImageNet weights')
     parser.add_argument('--skip_test', action='store_true',
                         help='Skip test-set evaluation while comparing training experiments')
     parser.set_defaults(skip_test=True)
@@ -176,10 +177,6 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.pretrained and args.model != 'convnext':
-        parser.error('--pretrained is only supported with --model convnext')
-    if args.pretrained and args.convnext_variant != 'tiny':
-        parser.error('--convnext_variant compact is only supported for scratch training')
     if not 0.0 <= args.label_smoothing < 1.0:
         parser.error('--label_smoothing must be in [0, 1)')
     if args.patience < 0:
@@ -190,8 +187,6 @@ def main():
         parser.error('--head_dropout must be in [0, 1)')
     if args.layer_scale_init < 0.0:
         parser.error('--layer_scale_init must be non-negative')
-    if args.pretrained and (args.drop_path_rate or args.head_dropout):
-        parser.error('--drop_path_rate and --head_dropout apply only to scratch ConvNeXt')
 
     os.makedirs(args.save_dir, exist_ok=True)
     seed_everything(args.seed)
@@ -208,23 +203,19 @@ def main():
         model = BaselineCNN(in_channels=1, num_classes=2).to(device)
         checkpoint_name = "best_baseline_model.pt"
     else:
-        if args.pretrained:
-            model = build_torchvision_convnext_tiny(pretrained=True, num_classes=2).to(device)
-            checkpoint_name = "best_convnext_pretrained_model.pt"
-        else:
-            model = ConvNeXtTiny(
-                in_channels=1,
-                num_classes=2,
-                drop_path_rate=args.drop_path_rate,
-                head_dropout=args.head_dropout,
-                layer_scale_init=args.layer_scale_init,
-                variant=args.convnext_variant,
-            ).to(device)
-            checkpoint_name = (
-                "best_convnext_compact_model.pt"
-                if args.convnext_variant == "compact"
-                else "best_convnext_model.pt"
-            )
+        model = ConvNeXtTiny(
+            in_channels=1,
+            num_classes=2,
+            drop_path_rate=args.drop_path_rate,
+            head_dropout=args.head_dropout,
+            layer_scale_init=args.layer_scale_init,
+            variant=args.convnext_variant,
+        ).to(device)
+        checkpoint_name = (
+            "best_convnext_compact_model.pt"
+            if args.convnext_variant == "compact"
+            else "best_convnext_model.pt"
+        )
 
     train_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     eval_criterion = nn.CrossEntropyLoss()
@@ -289,11 +280,9 @@ def main():
 
     curve_name = (
         f"convnext_{args.convnext_variant}_training_curves.png"
-        if args.model == 'convnext' and not args.pretrained
+        if args.model == 'convnext'
         else f"{args.model}_training_curves.png"
     )
-    if args.pretrained:
-        curve_name = "convnext_pretrained_training_curves.png"
     plot_metrics(history, os.path.join(args.save_dir, curve_name))
 
 

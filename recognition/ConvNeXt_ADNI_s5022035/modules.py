@@ -176,30 +176,3 @@ class ConvNeXtTiny(nn.Module):
         x = self.norm(x)
         x = self.head_dropout(x)
         return self.head(x)
-
-
-def build_torchvision_convnext_tiny(pretrained=False, num_classes=2):
-    from torchvision.models import ConvNeXt_Tiny_Weights, convnext_tiny
-
-    weights = ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
-    model = convnext_tiny(weights=weights)
-
-    first_conv = model.features[0][0]
-    grayscale_conv = nn.Conv2d(
-        1,
-        first_conv.out_channels,
-        kernel_size=first_conv.kernel_size,
-        stride=first_conv.stride,
-        padding=first_conv.padding,
-        dilation=first_conv.dilation,
-        groups=first_conv.groups,
-        bias=first_conv.bias is not None,
-        padding_mode=first_conv.padding_mode,
-    )
-    with torch.no_grad():
-        grayscale_conv.weight.copy_(first_conv.weight.mean(dim=1, keepdim=True))
-        if first_conv.bias is not None:
-            grayscale_conv.bias.copy_(first_conv.bias)
-    model.features[0][0] = grayscale_conv
-    model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
-    return model

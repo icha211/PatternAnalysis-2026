@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms as transforms
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold
 
 
 class ADNIDataset(Dataset):
@@ -78,12 +78,17 @@ def get_adni_dataloaders(
     val_ratio=0.15,
     random_state=42,
     num_workers=1,
+    augmentation="standard",
 ):
     train_dir = os.path.join(base_dir, "train")
     test_dir = os.path.join(base_dir, "test")
 
     train_patient_files = load_split_files(train_dir)
     test_patient_files = load_split_files(test_dir)
+    if {record["label"] for record in train_patient_files.values()} != {0, 1}:
+        raise ValueError("Both NC and AD patients must be present in training")
+    if {record["label"] for record in test_patient_files.values()} != {0, 1}:
+        raise ValueError("Both NC and AD patients must be present in test")
 
     overlapping_patients = set(train_patient_files).intersection(test_patient_files)
     if overlapping_patients:
@@ -92,16 +97,6 @@ def get_adni_dataloaders(
             f"occur in both train and test (examples: "
             f"{', '.join(sorted(overlapping_patients)[:5])})."
         )
-    
-    train_patient_ids = list(train_patient_files.keys())
-    train_labels = [train_patient_files[patient_id]["label"] for patient_id in train_patient_ids]
-    
-    tr_patient_ids, val_patient_ids = train_test_split(
-        train_patient_ids,
-        test_size=val_ratio,
-        random_state=random_state,
-        stratify=train_labels
-    )
     
     def assemble_paths(patient_files, patient_ids):
         paths, labels, assembled_patient_ids = [], [], []
@@ -112,23 +107,78 @@ def get_adni_dataloaders(
                 assembled_patient_ids.append(patient_id)
         return paths, labels, assembled_patient_ids
 
-    tr_paths, tr_labels, tr_patient_ids = assemble_paths(
-        train_patient_files, tr_patient_ids
+    train_patient_ids = list(train_patient_files)
+    all_train_paths, all_train_labels, all_train_patient_ids = assemble_paths(
+        train_patient_files, train_patient_ids
     )
-    val_paths, val_labels, val_patient_ids = assemble_paths(
-        train_patient_files, val_patient_ids
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError("val_ratio must be between 0 and 1")
+    if augmentation not in {"standard", "mild"}:
+        raise ValueError("augmentation must be 'standard' or 'mild'")
+
+    patient_counts_by_class = {}
+    for patient_id, record in train_patient_files.items():
+        label = record["label"]
+        patient_counts_by_class[label] = patient_counts_by_class.get(label, 0) + 1
+    min_class_patients = min(patient_counts_by_class.values())
+    n_splits = min(max(2, round(1.0 / val_ratio)), min_class_patients)
+    if n_splits < 2:
+        raise ValueError(
+            "At least two training patients per class are needed for a "
+            "stratified patient-group validation split"
+        )
+
+    splitter = StratifiedGroupKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=random_state,
     )
+    train_indices, val_indices = next(
+        splitter.split(
+            all_train_paths,
+            all_train_labels,
+            groups=all_train_patient_ids,
+        )
+    )
+    train_indices = train_indices.tolist()
+    val_indices = val_indices.tolist()
+    tr_paths = [all_train_paths[index] for index in train_indices]
+    tr_labels = [all_train_labels[index] for index in train_indices]
+    tr_patient_ids = [all_train_patient_ids[index] for index in train_indices]
+    val_paths = [all_train_paths[index] for index in val_indices]
+    val_labels = [all_train_labels[index] for index in val_indices]
+    val_patient_ids = [all_train_patient_ids[index] for index in val_indices]
+    if set(tr_patient_ids).intersection(val_patient_ids):
+        raise RuntimeError("Patient leakage detected between train and validation")
+
     test_patient_ids = list(test_patient_files.keys())
     test_paths, test_labels, test_patient_ids = assemble_paths(
         test_patient_files, test_patient_ids
     )
 
-    train_transform = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.RandomAffine(degrees=8, translate=(0.04, 0.04), scale=(0.95, 1.05)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
-    ])
+    if augmentation == "mild":
+        train_transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.RandomAffine(
+                degrees=5,
+                translate=(0.02, 0.02),
+                scale=(0.97, 1.03),
+            ),
+            transforms.ColorJitter(brightness=0.08, contrast=0.10),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5]),
+        ])
+    else:
+        train_transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.RandomAffine(
+                degrees=8,
+                translate=(0.04, 0.04),
+                scale=(0.95, 1.05),
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5]),
+        ])
 
     eval_transform = transforms.Compose([
         transforms.Resize((img_size, img_size)),

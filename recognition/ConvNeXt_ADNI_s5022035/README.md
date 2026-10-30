@@ -203,11 +203,7 @@ mean and standard deviation. This is a separate validation-only comparison
 
 ### 2.3 Models
 
-**ConvNeXt is a CNN, not a Transformer.** It adopts design ideas associated
-with Vision Transformers while retaining convolutional operations
-(Liu et al., 2022).
-This project adapts the architecture, not the paper's full ImageNet training
-recipe or reported performance.
+ConvNeXt is a convolutional neural network (CNN) that adopts design principles from Vision Transformers while retaining standard convolutional operations (Liu et al., 2022). This project adapts the core architecture rather than replicating the paper's full ImageNet training recipe or reported performance.
 
 ```mermaid
 flowchart LR
@@ -779,9 +775,11 @@ pipeline time per slice**, without a demonstrated screening advantage.
 **To:** Project Manager, MRI Classification Research Prototype<br>
 **Subject:** Model selection and next-stage evaluation
 
-**Decision:** I recommend retaining the small CNN for research comparisons
-and withholding both models from automated diagnosis. ConvNeXt's additional
-cost has not produced a clear operational benefit in this investigation.
+**Can we use this model?** **For research comparisons, yes; for automated
+diagnosis or clinical triage, no.** I recommend retaining the small CNN as
+the research baseline. Neither model meets the accuracy and error-referral
+targets, and ConvNeXt's additional cost has not produced a clear operational
+benefit in this investigation.
 
 #### Evidence supporting the decision
 
@@ -812,6 +810,22 @@ claims about performance on independent patients.
    improve accuracy without reducing overall AD or later-era AD recall.
    Repeated-seed confirmation and independent evaluation would follow before
    any deployment decision.
+
+#### Evidence required before reconsidering deployment
+
+| Unresolved issue | Required next evidence |
+|---|---|
+| **Accuracy and missed AD cases** | At least **80% overall slice accuracy** on an authorized independent evaluation cohort, together with subgroup recall and uncertainty estimates. Clinical specialists would need to define acceptable missed-case rates; the assignment target alone is not a clinical safety standard. |
+| **Acquisition-related failures** | Data representing both diagnoses across relevant acquisition groups, followed by separate assessment of later-era AD cases. Reweighting existing data has not resolved this weakness. |
+| **Unreliable confidence** | A validation-selected review rule assessed unchanged on independent data. The research target is **at least 80% coverage and 50% error referral**; meeting it would still require evaluation of reviewer workload and correction outcomes. |
+| **Uncertain repeatability** | Repeated-seed comparisons and evaluation on new subjects, with preprocessing and model-selection settings fixed beforehand. |
+| **Clinical workflow not evaluated** | Specialist-led assessment of patient-level decisions, review procedures and failure consequences before any clinical use. Current slice-level results do not establish this. |
+
+**Investment recommendation:** prioritize data coverage and a small,
+controlled validation study rather than a larger training budget alone.
+Further ConvNeXt work is justified only if it improves the accuracy,
+AD-detection and review-workload trade-off enough to offset its extra cost.
+None of the requirements above is claimed to have been achieved.
 
 ### Prioritized improvement plan (not yet executed)
 

@@ -5,6 +5,7 @@ import torch.nn as nn
 CONVNEXT_CONFIGS = {
     "tiny": ((3, 1, 3, 1), (96, 192, 384, 768)),
     "compact": ((2, 2, 6, 2), (40, 80, 160, 320)),
+    "paper_tiny": ((3, 3, 9, 3), (96, 192, 384, 768)),
 }
 
 
@@ -166,6 +167,16 @@ class ConvNeXtTiny(nn.Module):
         self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
         self.head_dropout = nn.Dropout(head_dropout)
         self.head = nn.Linear(dims[-1], num_classes)
+        if variant == "paper_tiny":
+            # Liu et al. (CVPR 2022): scratch initialization for the paper-sized variant.
+            self.apply(self._initialize_paper_weights)
+
+    @staticmethod
+    def _initialize_paper_weights(module):
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
     def forward(self, x):
         for downsample, stage in zip(self.downsample_layers, self.stages):

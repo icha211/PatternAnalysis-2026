@@ -1,11 +1,14 @@
 import os
 import random
+import json
+import hashlib
+from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms as transforms
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 
 
 class ADNIDataset(Dataset):
@@ -71,15 +74,134 @@ def seed_data_worker(worker_id):
     random.seed(worker_seed)
 
 
-def get_adni_dataloaders(
-    base_dir="/home/groups/comp3710/ADNI/AD_NC",
-    batch_size=32,
-    img_size=224,
-    val_ratio=0.15,
-    random_state=42,
-    num_workers=1,
-    augmentation="standard",
-):
+def slice_positions(file_paths):
+    positions = []
+    for path in file_paths:
+        extract_patient_id(path)
+        positions.append(int(os.path.splitext(os.path.basename(path))[0].split('_')[1]))
+    return np.asarray(positions)
+
+
+def training_position_bins(file_paths, bins=5):
+    if bins < 1:
+        raise ValueError("Position bin count must be positive")
+    positions = slice_positions(file_paths)
+    if not len(positions):
+        raise ValueError("Cannot bin an empty training dataset")
+    cuts = np.unique(np.quantile(positions, np.linspace(0, 1, bins + 1)[1:-1]))
+    return cuts, np.searchsorted(cuts, positions, side="right")
+
+
+def position_balanced_sample_weights(dataset, bins=5):
+    labels = np.asarray(dataset.labels)
+    if len(labels) != len(dataset.file_paths) or set(labels) != {0, 1}:
+        raise ValueError("Position balancing requires matching paths and NC/AD labels")
+    cuts, assignments = training_position_bins(dataset.file_paths, bins)
+    weights = np.empty(len(labels), dtype=np.float64)
+    rows = []
+    for index in range(len(cuts) + 1):
+        selected = assignments == index
+        count = int(selected.sum())
+        counts = [int(np.sum(selected & (labels == label))) for label in (0, 1)]
+        row = {
+            "lower_inclusive": float(cuts[index - 1]) if index else None,
+            "upper_exclusive": float(cuts[index]) if index < len(cuts) else None,
+            "n_slices": count,
+            "NC": counts[0],
+            "AD": counts[1],
+        }
+        rows.append(row)
+        if not count:
+            continue
+        if 0 in counts:
+            raise ValueError(
+                f"Position bin {row} is missing a class; cannot balance it. "
+                "Use fewer bins based on training data, not validation/test scores."
+            )
+        for label in (0, 1):
+            weights[selected & (labels == label)] = count / (2 * counts[label])
+    return torch.as_tensor(weights, dtype=torch.double), {
+        "training_bin_cuts": cuts.tolist(),
+        "bins": rows,
+        "min_weight": float(weights.min()),
+        "max_weight": float(weights.max()),
+        "policy": "Equal expected NC/AD mass within each bin; preserve bin mass",
+    }
+
+
+SPLIT_PROTOCOLS = ("original", "pooled_70_20_10", "subject_70_15_15")
+
+
+def pool_scan_files(train_files, test_files):
+    pooled = {}
+    seen = set()
+    for source in (train_files, test_files):
+        for patient, record in source.items():
+            target = pooled.setdefault(patient, {"label": record["label"], "files": []})
+            if target["label"] != record["label"]:
+                raise ValueError("Conflicting patient labels across original partitions")
+            for path, label in record["files"]:
+                key = (patient, os.path.basename(path))
+                if key in seen:
+                    raise ValueError("Duplicate patient/filename across original partitions")
+                seen.add(key)
+                target["files"].append((path, label))
+    return pooled
+
+
+def stratified_partitions(pooled, random_state, test_size, validation_size):
+    patients = sorted(pooled)
+    labels = [pooled[patient]["label"] for patient in patients]
+    development, test_ids = train_test_split(
+        patients, test_size=test_size, stratify=labels, random_state=random_state
+    )
+    train_ids, val_ids = train_test_split(
+        development, test_size=validation_size,
+        stratify=[pooled[patient]["label"] for patient in development],
+        random_state=random_state,
+    )
+    partitions = []
+    for ids in (train_ids, val_ids, test_ids):
+        selected = {patient: pooled[patient] for patient in sorted(ids)}
+        if {record["label"] for record in selected.values()} != {0, 1}:
+            raise ValueError("Every pooled partition must contain both classes")
+        partitions.append(selected)
+    return partitions
+
+
+def pooled_patient_partitions(train_files, test_files, random_state):
+    return stratified_partitions(
+        pool_scan_files(train_files, test_files), random_state, 0.10, 2 / 9
+    )
+
+
+def subject_partitions(train_files, test_files, random_state, metadata):
+    from utils import resolve_subject
+
+    subjects = {}
+    for scan, record in pool_scan_files(train_files, test_files).items():
+        subject = resolve_subject(metadata, scan, record["label"])
+        target = subjects.setdefault(subject, {"label": record["label"], "files": []})
+        if target["label"] != record["label"]:
+            raise ValueError("Conflicting subject labels across visits")
+        target["files"].extend(record["files"])
+    held_out_count = (len(subjects) * 15 + 99) // 100
+    return stratified_partitions(subjects, random_state, held_out_count, held_out_count)
+
+
+def assemble_paths(patient_files, patient_ids):
+    paths, labels, assembled_patient_ids = [], [], []
+    for patient_id in patient_ids:
+        for path, label in patient_files[patient_id]["files"]:
+            paths.append(path)
+            labels.append(label)
+            assembled_patient_ids.append(patient_id)
+    return paths, labels, assembled_patient_ids
+
+
+def split_paths(base_dir, val_ratio, random_state, split_protocol, metadata_path=None):
+    if split_protocol not in SPLIT_PROTOCOLS:
+        raise ValueError(f"Unknown split protocol: {split_protocol}")
     train_dir = os.path.join(base_dir, "train")
     test_dir = os.path.join(base_dir, "test")
 
@@ -90,6 +212,22 @@ def get_adni_dataloaders(
     if {record["label"] for record in test_patient_files.values()} != {0, 1}:
         raise ValueError("Both NC and AD patients must be present in test")
 
+    if split_protocol == "subject_70_15_15":
+        if metadata_path is None:
+            raise ValueError("Subject splitting requires an explicit metadata_path")
+        metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+        partitions = subject_partitions(
+            train_patient_files, test_patient_files, random_state, metadata
+        )
+        return tuple(assemble_paths(records, list(records)) for records in partitions)
+    if metadata_path is not None:
+        raise ValueError("metadata_path requires the subject_70_15_15 protocol")
+    if split_protocol == "pooled_70_20_10":
+        partitions = pooled_patient_partitions(
+            train_patient_files, test_patient_files, random_state
+        )
+        return tuple(assemble_paths(records, list(records)) for records in partitions)
+
     overlapping_patients = set(train_patient_files).intersection(test_patient_files)
     if overlapping_patients:
         raise ValueError(
@@ -98,24 +236,12 @@ def get_adni_dataloaders(
             f"{', '.join(sorted(overlapping_patients)[:5])})."
         )
     
-    def assemble_paths(patient_files, patient_ids):
-        paths, labels, assembled_patient_ids = [], [], []
-        for patient_id in patient_ids:
-            for path, label in patient_files[patient_id]["files"]:
-                paths.append(path)
-                labels.append(label)
-                assembled_patient_ids.append(patient_id)
-        return paths, labels, assembled_patient_ids
-
     train_patient_ids = list(train_patient_files)
     all_train_paths, all_train_labels, all_train_patient_ids = assemble_paths(
         train_patient_files, train_patient_ids
     )
     if not 0.0 < val_ratio < 1.0:
         raise ValueError("val_ratio must be between 0 and 1")
-    if augmentation not in {"standard", "mild"}:
-        raise ValueError("augmentation must be 'standard' or 'mild'")
-
     patient_counts_by_class = {}
     for patient_id, record in train_patient_files.items():
         label = record["label"]
@@ -155,6 +281,132 @@ def get_adni_dataloaders(
     test_paths, test_labels, test_patient_ids = assemble_paths(
         test_patient_files, test_patient_ids
     )
+    return ((tr_paths, tr_labels, tr_patient_ids),
+            (val_paths, val_labels, val_patient_ids),
+            (test_paths, test_labels, test_patient_ids))
+
+
+def split_manifest(loaders, base_dir, protocol, seed):
+    root = Path(base_dir).resolve()
+    splits = {}
+    for name, loader in zip(("train", "validation", "test"), loaders):
+        dataset = loader.dataset
+        splits[name] = [
+            {"path": Path(path).resolve().relative_to(root).as_posix(),
+             "label": int(label), "patient_id": patient}
+            for path, label, patient in zip(
+                dataset.file_paths, dataset.labels, dataset.patient_ids
+            )
+        ]
+    result = {"protocol": protocol, "seed": seed, "splits": splits}
+    if protocol == "subject_70_15_15":
+        result["identity_metadata_sha256"] = loaders[0].dataset.identity_metadata_sha256
+    return result
+
+
+def compute_channel_stats(file_paths, img_size):
+    if not file_paths or img_size < 1:
+        raise ValueError("Channel statistics require training images and a positive image size")
+    transform = transforms.Compose([
+        transforms.Resize((img_size, img_size)), transforms.ToTensor(),
+    ])
+    count, total, squared = 0, 0.0, 0.0
+    for path in file_paths:
+        with Image.open(path) as source:
+            values = transform(source.convert("L")).to(dtype=torch.float64)
+        count += values.numel()
+        total += values.sum().item()
+        squared += values.square().sum().item()
+    mean = total / count
+    std = float(np.sqrt(max(0.0, squared / count - mean * mean)))
+    if not np.isfinite(std) or std <= 0:
+        raise ValueError("Training images must have nonzero finite pixel standard deviation")
+    return {
+        "mean": mean, "std": std, "images": len(file_paths), "pixels": count,
+        "img_size": img_size,
+        "source": "Training split only; grayscale, deterministic resize, ToTensor; before augmentation",
+        "weighting": "Population pixel mean/std over all resized training images, including background",
+    }
+
+
+def normalization_values(values):
+    if not isinstance(values, (tuple, list)) or len(values) != 2:
+        raise ValueError("Normalization requires a (mean, std) pair")
+    mean, std = map(float, values)
+    if not np.isfinite([mean, std]).all() or not 0 <= mean <= 1 or std <= 0:
+        raise ValueError("Normalization needs finite mean in [0, 1] and positive std")
+    return mean, std
+
+
+def checkpoint_normalization(checkpoint, img_size=224):
+    directory = Path(checkpoint).parent
+    config_path = directory / "training_config.json"
+    mode = "fixed"
+    if config_path.exists():
+        mode = json.loads(config_path.read_text(encoding="utf-8")).get("normalization", "fixed")
+    if mode not in {"fixed", "training"}:
+        raise ValueError("Checkpoint declares an unsupported normalization mode")
+    path = directory / "normalization.json"
+    if mode == "training" and not path.is_file():
+        raise FileNotFoundError("Training-normalized checkpoint requires normalization.json")
+    if not path.exists():
+        return 0.5, 0.5
+    if mode != "training":
+        raise ValueError("normalization.json conflicts with checkpoint normalization mode")
+    report = json.loads(path.read_text(encoding="utf-8"))
+    manifest_path = directory / "split_manifest.json"
+    if (report.get("img_size") != img_size or not manifest_path.is_file()
+            or report.get("manifest_sha256") != hashlib.sha256(manifest_path.read_bytes()).hexdigest()):
+        raise ValueError("Checkpoint normalization image size or split provenance differs")
+    return normalization_values((report["mean"], report["std"]))
+
+
+def verify_checkpoint_split(checkpoint, loaders, base_dir, protocol, seed):
+    expected = checkpoint_normalization(checkpoint)
+    for loader in loaders:
+        actual = getattr(loader.dataset, "normalization_values", (0.5, 0.5))
+        if actual != expected:
+            raise ValueError("Checkpoint normalization differs from evaluation; load checkpoint_normalization first")
+    manifest_path = Path(checkpoint).parent / "split_manifest.json"
+    if not manifest_path.exists():
+        if protocol != "original":
+            raise ValueError("Pooled evaluation requires the training split_manifest.json")
+        return
+    saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+    current = split_manifest(loaders, base_dir, protocol, seed)
+    if saved != current:
+        raise ValueError("Checkpoint split manifest differs from current evaluation protocol/inventory")
+
+
+def get_adni_dataloaders(
+    base_dir="/home/groups/comp3710/ADNI/AD_NC",
+    batch_size=32,
+    img_size=224,
+    val_ratio=0.15,
+    random_state=42,
+    num_workers=1,
+    augmentation="standard",
+    split_protocol="original",
+    metadata_path=None,
+    normalization=(0.5, 0.5),
+):
+    if augmentation not in {"standard", "standard_flip", "mild"}:
+        raise ValueError("augmentation must be 'standard', 'standard_flip' or 'mild'")
+    train, validation, test = split_paths(
+        base_dir, val_ratio, random_state, split_protocol, metadata_path
+    )
+    tr_paths, tr_labels, tr_patient_ids = train
+    val_paths, val_labels, val_patient_ids = validation
+    test_paths, test_labels, test_patient_ids = test
+    groups = [set(partition[2]) for partition in (train, validation, test)]
+    if any(groups[i] & groups[j] for i, j in ((0, 1), (0, 2), (1, 2))):
+        raise RuntimeError("Patient leakage between generated partitions")
+
+    statistics = None
+    if normalization == "training":
+        statistics = compute_channel_stats(tr_paths, img_size)
+        normalization = (statistics["mean"], statistics["std"])
+    mean, std = normalization_values(normalization)
 
     if augmentation == "mild":
         train_transform = transforms.Compose([
@@ -166,7 +418,7 @@ def get_adni_dataloaders(
             ),
             transforms.ColorJitter(brightness=0.08, contrast=0.10),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5], std=[0.5]),
+            transforms.Normalize(mean=[mean], std=[std]),
         ])
     else:
         train_transform = transforms.Compose([
@@ -177,13 +429,16 @@ def get_adni_dataloaders(
                 scale=(0.95, 1.05),
             ),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5], std=[0.5]),
+            transforms.Normalize(mean=[mean], std=[std]),
         ])
+
+    if augmentation == "standard_flip":
+        train_transform.transforms.insert(1, transforms.RandomHorizontalFlip(p=0.5))
 
     eval_transform = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
+        transforms.Normalize(mean=[mean], std=[std])
     ])
 
     train_dataset = ADNIDataset(
@@ -195,6 +450,13 @@ def get_adni_dataloaders(
     test_dataset = ADNIDataset(
         test_paths, test_labels, test_patient_ids, transform=eval_transform
     )
+    for dataset in (train_dataset, val_dataset, test_dataset):
+        dataset.normalization_values = (mean, std)
+        dataset.channel_statistics = statistics
+    if split_protocol == "subject_70_15_15":
+        digest = hashlib.sha256(Path(metadata_path).read_bytes()).hexdigest()
+        for dataset in (train_dataset, val_dataset, test_dataset):
+            dataset.identity_metadata_sha256 = digest
 
     generator = torch.Generator()
     generator.manual_seed(random_state)

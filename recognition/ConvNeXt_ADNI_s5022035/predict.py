@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
 
-from dataset import get_adni_dataloaders
+from dataset import SPLIT_PROTOCOLS, checkpoint_normalization, get_adni_dataloaders, verify_checkpoint_split
 from modules import (
     CONVNEXT_CONFIGS,
     BaselineCNN,
@@ -103,6 +103,9 @@ def main():
     )
     parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--data_dir', type=str, default='/home/groups/comp3710/ADNI/AD_NC')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--split_protocol', choices=SPLIT_PROTOCOLS, default='original')
+    parser.add_argument('--metadata_path', default=None)
     parser.add_argument('--results_dir', type=str, default='./results',
                         help='Directory for test plots and failure-case images')
     args = parser.parse_args()
@@ -111,10 +114,23 @@ def main():
         if args.model == 'baseline':
             args.checkpoint = './checkpoints/best_baseline_model.pt'
         else:
-            args.checkpoint = './checkpoints/best_convnext_model.pt'
+            filename = ("best_convnext_model.pt" if args.convnext_variant == 'tiny'
+                        else f"best_convnext_{args.convnext_variant}_model.pt")
+            args.checkpoint = os.path.join('./checkpoints', filename)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    _, _, test_loader = get_adni_dataloaders(base_dir=args.data_dir, batch_size=32)
+    loaders = get_adni_dataloaders(
+        base_dir=args.data_dir, batch_size=32, random_state=args.seed,
+        split_protocol=args.split_protocol,
+        metadata_path=args.metadata_path,
+        normalization=checkpoint_normalization(args.checkpoint),
+    )
+    verify_checkpoint_split(
+        args.checkpoint, loaders, args.data_dir, args.split_protocol, args.seed
+    )
+    _, _, test_loader = loaders
+    if args.split_protocol != 'original':
+        print("EXPLORATORY pooled protocol; results do not replace the original benchmark.")
 
     if args.model == 'baseline':
         model = BaselineCNN(in_channels=1, num_classes=2).to(device)

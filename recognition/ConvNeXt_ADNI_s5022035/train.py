@@ -1,5 +1,8 @@
 import os
 import argparse
+import json
+import hashlib
+from pathlib import Path
 import random
 import time
 import numpy as np
@@ -10,7 +13,14 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import matplotlib.pyplot as plt
 
-from dataset import get_adni_dataloaders, seed_data_worker
+from dataset import (
+    get_adni_dataloaders,
+    position_balanced_sample_weights,
+    seed_data_worker,
+    SPLIT_PROTOCOLS,
+    split_manifest,
+)
+from utils import era_balanced_sample_weights
 from modules import (
     CONVNEXT_CONFIGS,
     BaselineCNN,
@@ -259,6 +269,12 @@ def main():
     parser.add_argument('--patience', type=int, default=6,
                         help='Stop after this many epochs without validation-accuracy improvement; 0 disables')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--split_protocol', choices=SPLIT_PROTOCOLS, default='original',
+                        help='Pooled protocol is a separate exploratory experiment, not the original benchmark')
+    parser.add_argument('--metadata_path', default=None,
+                        help='ADNI metadata required for subject_70_15_15')
+    parser.add_argument('--normalization', choices=['fixed', 'training'], default='fixed',
+                        help='Use legacy 0.5/0.5 scaling or resized training-only pixel statistics')
     parser.add_argument('--num_workers', type=int, default=1, help='DataLoader worker count')
     parser.add_argument('--drop_path_rate', type=float, default=0.0,
                         help='Maximum stochastic-depth rate for scratch ConvNeXt')
@@ -266,16 +282,29 @@ def main():
                         help='Classifier dropout for scratch ConvNeXt')
     parser.add_argument('--layer_scale_init', type=float, default=1e-6,
                         help='Initial residual layer scale for scratch ConvNeXt')
-    parser.add_argument(
+    sampling = parser.add_mutually_exclusive_group()
+    sampling.add_argument(
         '--patient_balanced_sampling',
         action='store_true',
         help='Sample classes equally and patients equally within each class',
     )
+    sampling.add_argument(
+        '--position_balanced_sampling',
+        action='store_true',
+        help='Balance NC/AD within training-derived position bins; preserve bin mass',
+    )
+    sampling.add_argument(
+        '--era_balanced_sampling',
+        action='store_true',
+        help='Keep NC/AD draw mass equal and split AD draws equally by acquisition era',
+    )
+    parser.add_argument('--position_bins', type=int, default=5,
+                        help='Training quantile bins for position balancing')
     parser.add_argument(
         '--augmentation',
-        choices=['standard', 'mild'],
+        choices=['standard', 'standard_flip', 'mild'],
         default='standard',
-        help='Training-only image augmentation profile',
+        help='Training-only profile; standard_flip adds experimental 50%% horizontal flips',
     )
     parser.add_argument(
         '--save_validation_gradcam',
@@ -310,16 +339,45 @@ def main():
         parser.error('--class_balance_beta must be in [0, 1)')
     if args.ad_loss_weight <= 0.0:
         parser.error('--ad_loss_weight must be positive')
+    if args.position_bins < 1:
+        parser.error('--position_bins must be positive')
     if args.loss == 'focal' and args.label_smoothing != 0.0:
         parser.error('--label_smoothing must be 0 when using focal loss')
-    if args.loss == 'focal' and args.patient_balanced_sampling:
+    if args.loss == 'focal' and (
+        args.patient_balanced_sampling
+        or args.position_balanced_sampling
+        or args.era_balanced_sampling
+    ):
         parser.error(
-            'Choose focal loss or patient-balanced sampling, not both, '
+            'Choose focal loss or balanced sampling, not both, '
             'to avoid applying class balancing twice'
         )
+    if args.era_balanced_sampling and args.split_protocol != 'subject_70_15_15':
+        parser.error('--era_balanced_sampling requires --split_protocol subject_70_15_15')
+    if args.era_balanced_sampling and not args.metadata_path:
+        parser.error('--era_balanced_sampling requires --metadata_path')
     if args.save_validation_gradcam and args.model != 'convnext':
         parser.error('--save_validation_gradcam requires --model convnext')
+    if args.normalization == 'training' and (
+        args.split_protocol != 'subject_70_15_15' or not args.skip_test
+    ):
+        parser.error('Training-derived normalization requires subject_70_15_15 and --skip_test')
 
+    separate_run = args.split_protocol != 'original' or (
+        args.model == 'convnext' and args.convnext_variant == 'paper_tiny'
+    )
+    if separate_run:
+        if args.save_dir == './checkpoints' or (
+            os.path.exists(args.save_dir) and os.listdir(args.save_dir)
+        ):
+            parser.error('Separate protocol or paper_tiny experiments require an empty --save_dir')
+    if args.split_protocol == 'subject_70_15_15':
+        print("Subject-disjoint validation experiment; the held-out test split is not evaluated.")
+    elif args.split_protocol != 'original':
+        print(f"EXPLORATORY {args.split_protocol} split; original benchmark test images may enter training.")
+        print("This does not restore an untouched test set or replace original benchmark results.")
+    if args.split_protocol != 'subject_70_15_15':
+        print("WARNING: legacy scan-prefix grouping does not enforce unique-subject separation.")
     os.makedirs(args.save_dir, exist_ok=True)
     seed_everything(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -330,7 +388,30 @@ def main():
         random_state=args.seed,
         num_workers=args.num_workers,
         augmentation=args.augmentation,
+        split_protocol=args.split_protocol,
+        metadata_path=args.metadata_path,
+        normalization='training' if args.normalization == 'training' else (0.5, 0.5),
     )
+    if separate_run:
+        manifest = split_manifest(
+            (train_loader, val_loader, test_loader), args.data_dir, args.split_protocol, args.seed
+        )
+        with open(os.path.join(args.save_dir, "split_manifest.json"), "w") as stream:
+            json.dump(manifest, stream, indent=2, allow_nan=False)
+        if args.normalization == 'training':
+            manifest_path = Path(args.save_dir) / "split_manifest.json"
+            statistics = {
+                **train_loader.dataset.channel_statistics,
+                "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            }
+            (Path(args.save_dir) / "normalization.json").write_text(
+                json.dumps(statistics, indent=2, allow_nan=False), encoding="utf-8"
+            )
+            print("Training-only normalization: " + json.dumps(statistics, allow_nan=False))
+        with open(os.path.join(args.save_dir, "training_config.json"), "w") as stream:
+            json.dump(vars(args), stream, indent=2, allow_nan=False)
+        for name, rows in manifest["splits"].items():
+            print(f"{name}: {len(rows)} slices / {len({row['patient_id'] for row in rows})} patients")
 
     if args.model == 'baseline':
         model = BaselineCNN(in_channels=1, num_classes=2).to(device)
@@ -344,11 +425,8 @@ def main():
             layer_scale_init=args.layer_scale_init,
             variant=args.convnext_variant,
         ).to(device)
-        checkpoint_name = (
-            "best_convnext_compact_model.pt"
-            if args.convnext_variant == "compact"
-            else "best_convnext_model.pt"
-        )
+        checkpoint_name = ("best_convnext_model.pt" if args.convnext_variant == "tiny"
+                           else f"best_convnext_{args.convnext_variant}_model.pt")
 
     if args.loss == 'focal':
         alpha = class_balanced_patient_weights(
@@ -360,9 +438,30 @@ def main():
     else:
         train_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     eval_criterion = nn.CrossEntropyLoss()
-    if args.patient_balanced_sampling:
+    if (args.patient_balanced_sampling or args.position_balanced_sampling
+            or args.era_balanced_sampling):
+        if args.era_balanced_sampling:
+            with open(args.metadata_path, encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            sample_weights, sampling_report = era_balanced_sample_weights(
+                train_loader.dataset, metadata
+            )
+            sampling_report["seed"] = args.seed
+            with open(os.path.join(args.save_dir, "acquisition_sampling.json"), "w") as stream:
+                json.dump(sampling_report, stream, indent=2, allow_nan=False)
+            print("Acquisition-era sampling:", json.dumps(sampling_report))
+        elif args.position_balanced_sampling:
+            sample_weights, sampling_report = position_balanced_sample_weights(
+                train_loader.dataset, args.position_bins
+            )
+            sampling_report["seed"] = args.seed
+            with open(os.path.join(args.save_dir, "position_sampling.json"), "w") as stream:
+                json.dump(sampling_report, stream, indent=2, allow_nan=False)
+            print("Position sampling:", json.dumps(sampling_report))
+        else:
+            sample_weights = patient_balanced_sample_weights(train_loader.dataset)
         sampler = WeightedRandomSampler(
-            patient_balanced_sample_weights(train_loader.dataset),
+            sample_weights,
             num_samples=len(train_loader.dataset),
             replacement=True,
             generator=torch.Generator().manual_seed(args.seed),
@@ -414,6 +513,13 @@ def main():
 
     total_time = time.time() - start_time
     print(f"\nTraining completed in {total_time / 60:.2f} minutes. Best Val Acc: {best_val_acc:.4f}")
+    if separate_run:
+        with open(os.path.join(args.save_dir, "training_history.json"), "w") as stream:
+            json.dump({
+                "status": f"Exploratory {args.split_protocol} protocol; {args.model}/{args.convnext_variant}",
+                "history": history, "best_validation_accuracy": best_val_acc,
+                "training_minutes": total_time / 60,
+            }, stream, indent=2, allow_nan=False)
 
     best_checkpoint = os.path.join(args.save_dir, checkpoint_name)
     model.load_state_dict(torch.load(best_checkpoint, map_location=device))

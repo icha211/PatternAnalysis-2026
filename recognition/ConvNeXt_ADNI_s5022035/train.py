@@ -28,6 +28,79 @@ from modules import (
 )
 
 
+def initialize_imagenet_trunk(model, source):
+    target = model.state_dict()
+    mapping = {}
+    for suffix in ("weight", "bias"):
+        mapping[f"downsample_layers.0.0.{suffix}"] = f"features.0.0.{suffix}"
+        mapping[f"downsample_layers.0.1.norm.{suffix}"] = f"features.0.1.{suffix}"
+        mapping[f"norm.{suffix}"] = f"classifier.0.{suffix}"
+    for stage_index, depth in enumerate((3, 3, 9, 3)):
+        for block_index in range(depth):
+            prefix = f"stages.{stage_index}.{block_index}"
+            original = f"features.{2 * stage_index + 1}.{block_index}"
+            mapping[f"{prefix}.gamma"] = f"{original}.layer_scale"
+            for name, index in (("dwconv", 0), ("norm", 2), ("pwconv1", 3), ("pwconv2", 5)):
+                for suffix in ("weight", "bias"):
+                    mapping[f"{prefix}.{name}.{suffix}"] = f"{original}.block.{index}.{suffix}"
+        if stage_index:
+            for suffix in ("weight", "bias"):
+                mapping[f"downsample_layers.{stage_index}.0.norm.{suffix}"] = (
+                    f"features.{2 * stage_index}.0.{suffix}"
+                )
+                mapping[f"downsample_layers.{stage_index}.1.{suffix}"] = (
+                    f"features.{2 * stage_index}.1.{suffix}"
+                )
+    if set(mapping) != {name for name in target if not name.startswith("head.")}:
+        raise ValueError("ImageNet initialization requires the complete paper_tiny trunk")
+    if set(source) != set(mapping.values()) | {"classifier.2.weight", "classifier.2.bias"}:
+        raise ValueError("ImageNet checkpoint contains an unexpected set of weights")
+    converted = {}
+    for name, original in mapping.items():
+        value = source[original]
+        if name == "downsample_layers.0.0.weight":
+            if tuple(value.shape) != (96, 3, 4, 4):
+                raise ValueError("Expected a three-channel ImageNet stem")
+            # Summation preserves the response to an identical grayscale input in all RGB channels.
+            value = value.sum(dim=1, keepdim=True)
+        elif name.endswith(".gamma"):
+            if tuple(value.shape) != (target[name].numel(), 1, 1):
+                raise ValueError(f"Unexpected ImageNet layer-scale shape: {original}")
+            value = value.reshape(-1)
+        if value.shape != target[name].shape or not torch.isfinite(value).all():
+            raise ValueError(f"ImageNet tensor shape or values are invalid: {original}")
+        converted[name] = value
+    model.load_state_dict({**target, **converted}, strict=True)
+    return len(converted)
+
+
+def load_imagenet_initialization(model, save_dir):
+    from torchvision.models import ConvNeXt_Tiny_Weights
+    from urllib.parse import urlparse
+
+    weights = ConvNeXt_Tiny_Weights.IMAGENET1K_V1
+    source = weights.get_state_dict(progress=True, check_hash=True)
+    cached = Path(torch.hub.get_dir()) / "checkpoints" / Path(urlparse(weights.url).path).name
+    digest = hashlib.sha256(cached.read_bytes()).hexdigest()
+    if not digest.startswith(cached.stem.rsplit("-", 1)[1]):
+        raise ValueError("Cached ImageNet weights do not match the published hash prefix")
+    count = initialize_imagenet_trunk(model, source)
+    report = {
+        "weights": "torchvision.ConvNeXt_Tiny_Weights.IMAGENET1K_V1",
+        "url": weights.url,
+        "weights_file_sha256": digest,
+        "loaded_trunk_tensors": count,
+        "grayscale_stem": "Sum the three RGB input-channel kernels",
+        "classifier": "Original randomly initialized two-class head retained",
+        "preprocessing": "Project fixed 0.5/0.5 grayscale scaling; not ImageNet RGB preprocessing",
+        "fine_tuning": "All parameters trainable",
+    }
+    (Path(save_dir) / "pretrained_initialization.json").write_text(
+        json.dumps(report, indent=2, allow_nan=False), encoding="utf-8"
+    )
+    print("ImageNet initialization: " + json.dumps(report, allow_nan=False), flush=True)
+
+
 def train_one_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
     running_loss = 0.0
@@ -36,6 +109,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
 
     for images, labels in dataloader:
         images, labels = images.to(device), labels.to(device)
+        augmentation = getattr(dataloader.dataset, "device_augmentation", None)
+        if augmentation is not None:
+            images = augmentation(images)
 
         optimizer.zero_grad()
         outputs = model(images)
@@ -243,6 +319,10 @@ def main():
     parser = argparse.ArgumentParser(description="Train Baseline or ConvNeXt model on ADNI dataset")
     parser.add_argument('--model', type=str, default='convnext', choices=['baseline', 'convnext'], help='Model architecture')
     parser.add_argument(
+        '--initialization', choices=['scratch', 'imagenet'], default='scratch',
+        help='Optional ImageNet trunk initialization for the validation-only paper_tiny model',
+    )
+    parser.add_argument(
         '--convnext_variant',
         type=str,
         default='tiny',
@@ -268,6 +348,10 @@ def main():
     parser.add_argument('--ad_loss_weight', type=float, default=1.0)
     parser.add_argument('--patience', type=int, default=6,
                         help='Stop after this many epochs without validation-accuracy improvement; 0 disables')
+    parser.add_argument(
+        '--save_best_val_loss', action='store_true',
+        help='Also save the lowest-validation-cross-entropy checkpoint; early stopping stays accuracy-based',
+    )
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--split_protocol', choices=SPLIT_PROTOCOLS, default='original',
                         help='Pooled protocol is a separate exploratory experiment, not the original benchmark')
@@ -276,6 +360,9 @@ def main():
     parser.add_argument('--normalization', choices=['fixed', 'training'], default='fixed',
                         help='Use legacy 0.5/0.5 scaling or resized training-only pixel statistics')
     parser.add_argument('--num_workers', type=int, default=1, help='DataLoader worker count')
+    parser.add_argument('--cache_dir', default=None, help='Optional private decoded uint8 image cache')
+    parser.add_argument('--gpu_augmentation', action='store_true',
+                        help='Apply training affine/jitter transforms on CUDA tensors')
     parser.add_argument('--drop_path_rate', type=float, default=0.0,
                         help='Maximum stochastic-depth rate for scratch ConvNeXt')
     parser.add_argument('--head_dropout', type=float, default=0.0,
@@ -323,6 +410,16 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.save_best_val_loss and (
+        args.split_protocol != 'subject_70_15_15' or not args.skip_test
+    ):
+        parser.error('--save_best_val_loss requires subject_70_15_15 and --skip_test')
+    if args.initialization == "imagenet" and (
+        args.model != "convnext" or args.convnext_variant != "paper_tiny"
+        or args.split_protocol != "subject_70_15_15" or not args.skip_test
+        or args.normalization != "fixed"
+    ):
+        parser.error('ImageNet initialization requires paper_tiny, subject_70_15_15, fixed normalization and --skip_test')
     if not 0.0 <= args.label_smoothing < 1.0:
         parser.error('--label_smoothing must be in [0, 1)')
     if args.patience < 0:
@@ -381,6 +478,8 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     seed_everything(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.gpu_augmentation and device.type != 'cuda':
+        parser.error('--gpu_augmentation requires CUDA')
 
     train_loader, val_loader, test_loader = get_adni_dataloaders(
         base_dir=args.data_dir,
@@ -391,6 +490,8 @@ def main():
         split_protocol=args.split_protocol,
         metadata_path=args.metadata_path,
         normalization='training' if args.normalization == 'training' else (0.5, 0.5),
+        cache_dir=args.cache_dir,
+        gpu_augmentation=args.gpu_augmentation,
     )
     if separate_run:
         manifest = split_manifest(
@@ -427,6 +528,9 @@ def main():
         ).to(device)
         checkpoint_name = ("best_convnext_model.pt" if args.convnext_variant == "tiny"
                            else f"best_convnext_{args.convnext_variant}_model.pt")
+
+    if args.initialization == "imagenet":
+        load_imagenet_initialization(model, args.save_dir)
 
     if args.loss == 'focal':
         alpha = class_balanced_patient_weights(
@@ -478,6 +582,8 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     best_val_acc = float('-inf')
+    best_val_loss = float('inf')
+    selection_records = {}
     epochs_without_improvement = 0
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
     start_time = time.time()
@@ -489,6 +595,8 @@ def main():
         val_loss, val_acc = evaluate(
             model, val_loader, eval_criterion, device
         )
+        if not np.isfinite([train_loss, train_acc, val_loss, val_acc]).all():
+            raise ValueError(f"Non-finite training or validation metrics at epoch {epoch}")
         scheduler.step()
 
         history['train_loss'].append(train_loss)
@@ -505,8 +613,36 @@ def main():
             epochs_without_improvement = 0
             checkpoint_path = os.path.join(args.save_dir, checkpoint_name)
             torch.save(model.state_dict(), checkpoint_path)
+            selection_records["accuracy"] = {
+                "epoch": epoch, "val_acc": val_acc, "val_loss": val_loss,
+                "checkpoint": checkpoint_name,
+            }
+            if args.save_best_val_loss:
+                selection_records["accuracy"]["checkpoint_sha256"] = hashlib.sha256(
+                    Path(checkpoint_path).read_bytes()
+                ).hexdigest()
         else:
             epochs_without_improvement += 1
+
+        if args.save_best_val_loss and val_loss < best_val_loss:
+            best_val_loss = val_loss
+            loss_checkpoint = f"{Path(checkpoint_name).stem}_val_loss.pt"
+            torch.save(model.state_dict(), os.path.join(args.save_dir, loss_checkpoint))
+            selection_records["val_loss"] = {
+                "epoch": epoch, "val_acc": val_acc, "val_loss": val_loss,
+                "checkpoint": loss_checkpoint,
+                "checkpoint_sha256": hashlib.sha256(
+                    (Path(args.save_dir) / loss_checkpoint).read_bytes()
+                ).hexdigest(),
+            }
+        if args.save_best_val_loss:
+            (Path(args.save_dir) / "checkpoint_selection.json").write_text(
+                json.dumps({
+                    "early_stopping": "Validation accuracy; unchanged",
+                    "tie_policy": "First epoch wins exact ties",
+                    "selections": selection_records,
+                }, indent=2, allow_nan=False), encoding="utf-8"
+            )
 
         if args.patience and epochs_without_improvement >= args.patience:
             break

@@ -2,34 +2,102 @@ import os
 import random
 import json
 import hashlib
+import tempfile
 from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 
 
 class ADNIDataset(Dataset):
-    def __init__(self, file_paths, labels, patient_ids, transform=None):
+    def __init__(self, file_paths, labels, patient_ids, transform=None, cache_dir=None):
         self.file_paths = file_paths
         self.labels = labels
         self.patient_ids = patient_ids
         self.transform = transform
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+
+    def load_image(self, img_path):
+        if self.cache_dir is None:
+            with Image.open(img_path) as source:
+                return source.convert("L")
+        source_path = Path(img_path).resolve()
+        stat = source_path.stat()
+        key = hashlib.sha256(
+            f"gray-v1:{source_path}:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}".encode()
+        ).hexdigest()
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        cached = self.cache_dir / f"{key}.npy"
+        if cached.exists():
+            values = np.load(cached, allow_pickle=False)
+            if values.dtype != np.uint8 or values.ndim != 2 or not values.size:
+                raise ValueError(f"Invalid decoded-image cache: {cached}")
+        else:
+            with Image.open(source_path) as source:
+                values = np.array(source.convert("L"), dtype=np.uint8)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=self.cache_dir, suffix=".tmp", delete=False) as stream:
+                    temporary = Path(stream.name)
+                    np.save(stream, values, allow_pickle=False)
+                os.replace(temporary, cached)
+            finally:
+                if temporary is not None and temporary.exists():
+                    temporary.unlink()
+        return Image.fromarray(values)
 
     def __len__(self):
         return len(self.file_paths)
 
     def __getitem__(self, idx):
         img_path = self.file_paths[idx]
-        image = Image.open(img_path).convert("L")  # 1-channel grayscale MRI
+        image = self.load_image(img_path)
         label = self.labels[idx]
 
         if self.transform:
             image = self.transform(image)
 
         return image, label
+
+
+class DeviceAugmentation:
+    """Tensor augmentation after transfer; same parameter ranges as the CPU profiles."""
+
+    def __init__(self, profile, mean, std):
+        if profile not in {"standard", "standard_flip", "mild"}:
+            raise ValueError("Unknown device augmentation profile")
+        self.profile = profile
+        self.mean, self.std = normalization_values((mean, std))
+
+    def __call__(self, images):
+        if images.ndim != 4 or images.shape[1] != 1 or not images.shape[0]:
+            raise ValueError("Device augmentation requires a nonempty [B, 1, H, W] tensor")
+        augmented = []
+        mild = self.profile == "mild"
+        degrees, translation, scale_range = (5, 0.02, (0.97, 1.03)) if mild else (8, 0.04, (0.95, 1.05))
+        for image in images:
+            if self.profile == "standard_flip" and torch.rand((), device=image.device).item() < 0.5:
+                image = TF.hflip(image)
+            params = transforms.RandomAffine.get_params(
+                [-degrees, degrees], [translation, translation], list(scale_range), None,
+                [image.shape[-1], image.shape[-2]],
+            )
+            image = TF.affine(image, *params, interpolation=transforms.InterpolationMode.NEAREST, fill=0)
+            if mild:
+                order, brightness, contrast, _, _ = transforms.ColorJitter.get_params(
+                    [0.92, 1.08], [0.90, 1.10], None, None
+                )
+                for operation in order:
+                    if operation == 0:
+                        image = TF.adjust_brightness(image, brightness)
+                    elif operation == 1:
+                        image = TF.adjust_contrast(image, contrast)
+            augmented.append(image)
+        return TF.normalize(torch.stack(augmented), [self.mean], [self.std])
 
 
 def extract_patient_id(file_path):
@@ -389,6 +457,8 @@ def get_adni_dataloaders(
     split_protocol="original",
     metadata_path=None,
     normalization=(0.5, 0.5),
+    cache_dir=None,
+    gpu_augmentation=False,
 ):
     if augmentation not in {"standard", "standard_flip", "mild"}:
         raise ValueError("augmentation must be 'standard', 'standard_flip' or 'mild'")
@@ -440,16 +510,22 @@ def get_adni_dataloaders(
         transforms.ToTensor(),
         transforms.Normalize(mean=[mean], std=[std])
     ])
+    if gpu_augmentation:
+        train_transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)), transforms.ToTensor(),
+        ])
 
     train_dataset = ADNIDataset(
-        tr_paths, tr_labels, tr_patient_ids, transform=train_transform
+        tr_paths, tr_labels, tr_patient_ids, transform=train_transform, cache_dir=cache_dir
     )
     val_dataset = ADNIDataset(
-        val_paths, val_labels, val_patient_ids, transform=eval_transform
+        val_paths, val_labels, val_patient_ids, transform=eval_transform, cache_dir=cache_dir
     )
     test_dataset = ADNIDataset(
-        test_paths, test_labels, test_patient_ids, transform=eval_transform
+        test_paths, test_labels, test_patient_ids, transform=eval_transform, cache_dir=cache_dir
     )
+    if gpu_augmentation:
+        train_dataset.device_augmentation = DeviceAugmentation(augmentation, mean, std)
     for dataset in (train_dataset, val_dataset, test_dataset):
         dataset.normalization_values = (mean, std)
         dataset.channel_statistics = statistics

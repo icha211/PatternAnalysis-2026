@@ -12,17 +12,24 @@ I investigate three questions: which model is more accurate, whether low
 confidence helps identify mistakes for human review, and whether ConvNeXt's
 extra computation provides a useful benefit.
 
-**Main conclusion:** ConvNeXt ranks AD probabilities better, but the CNN has higher
-accuracy and detects more AD slices at the fixed decision threshold. Neither
-model meets the 80% accuracy target or the error-referral criterion.
+**Main conclusion:** In the original frozen corrected-test comparison, the CNN has
+higher accuracy and detects more AD slices at the fixed threshold, while
+ConvNeXt ranks AD probabilities better. A later ImageNet-initialized ConvNeXt
+achieved **79.55% test accuracy**, with only **27.00%** recall for later-era
+AD. The subsequent regularized model reached **82.09% overall test accuracy**
+and **80.22% AD recall** in a frozen exploratory evaluation, meeting the
+numerical 80% target. Later-era AD recall remained **50.00%**. Prior test
+exposure and this subgroup weakness do not justify clinical screening.
 
 | Main finding | Result |
 |---|---|
-| Overall corrected-test accuracy | CNN **75.80%**, ConvNeXt **74.98%** |
-| Assignment target: at least 80% overall test accuracy | **Not met by either model** |
-| Confidence-based referral | Both rules retain over 80% of slices but refer fewer than 36% of errors |
-| Cost of ConvNeXt | 71.5 times as many parameters; 3.45 times the observed training time |
-| Recommendation | CNN retained as the research baseline; **neither model is suitable for automated diagnosis** |
+| Frozen corrected-test accuracy | CNN **75.80%**, scratch ConvNeXt **74.98%** |
+| ImageNet follow-up | **82.49% validation / 79.55% test accuracy**. Later-era AD test recall **27.00%** |
+| Regularized ImageNet follow-up | **84.65% validation / 82.09% exploratory test accuracy**. AD test recall **80.22%**, later-era AD **50.00%** |
+| Assignment target: at least 80% overall test accuracy | **Met numerically by the regularized exploratory test** (3,612 / 4,400). The test cohort had been used in earlier experiments |
+| Confidence-based referral | Both primary-model rules retain over 80% of slices but refer fewer than 36% of errors |
+| Cost of ConvNeXt | 71.5 times as many parameters and 3.45 times the observed training time |
+| Recommendation | Keep the CNN as research baseline. **Do not use either model for automated diagnosis** |
 
 
 ## Contents
@@ -36,6 +43,10 @@ model meets the 80% accuracy target or the error-referral criterion.
 7. [Recommendation and limitations](#7-recommendation-and-limitations)
 8. [Reproduction](#8-reproduction)
 9. [References and AI disclosure](#9-references-and-ai-disclosure)
+
+Results describe **slices, not patient diagnoses**, unless explicitly labelled
+otherwise. NC is the dataset's name for the normal class
+(called CN in the assignment).
 
 ## 1. Feasibility review
 
@@ -69,7 +80,7 @@ An early test run I executed for ConvNeXt took 70.65 minutes, which proves that 
 ### 1.4 Risks and bounded next step
 
 - **Main risks:** The model picking up on background scanner noise instead of brain features, overfitting, using validation data too many times, and running out of GPU time limits.
-- **Planned comparison after the audit:** Train and test both models side-by-side using identical settings, relying only on validation data to make decisions.
+- **Completed comparison:** The CNN and scratch ConvNeXt were compared on the corrected subject split. Follow-up model selection used validation data.
 - **Resource budget:** Two training runs capped at 2 GPU hours each, followed by diagnostic tests on saved models.
 - **If jobs time out:** If a job runs out of time, it will not restart automatically and it will simply save partial results.
 - **Fallback:** If ConvNeXt does not offer a good balance of speed, accuracy, and error detection, I will keep the simple CNN as my main baseline for future work.
@@ -83,7 +94,7 @@ During this project, I made four main updates:
 | **Grouped data by patient ID instead of scan name** | Preserve all scans from the same person in one group. This fix completely eliminated patient overlap across my datasets. |
 | **Kept horizontal flips disabled during data augmentation** | In my matched validation experiment, enabling image flips slightly raised overall accuracy, but it reduced Alzheimer's recall (Section 5.5). |
 | **Completed the two-model comparison** | The CNN finished training in 9.52 minutes and ConvNeXt in 32.82 minutes. Test accuracy reached **75.80% (CNN) and 74.98% (ConvNeXt)**.|
-| **Tested error referral and fixes** | Both models met the target for accepting enough scans, but neither flagged enough errors for human review. I ran three extra follow-up experiments, but they also failed to improve the detection of Alzheimer's cases. |
+| **Tested referral and model alternatives** | The primary models missed the error-referral target. Initial pretraining reached 79.55% test accuracy. The subsequent regularized model reached **82.09% exploratory test accuracy**, meeting the numerical target. Later-era AD test recall remained **50.00%**, so it was not adopted for clinical screening. |
 
 ## 2. Data and method
 
@@ -91,7 +102,7 @@ During this project, I made four main updates:
 
 I used the course-provided Alzheimer's Disease Neuroimaging Initiative (ADNI) collection (Alzheimer's Disease Neuroimaging Initiative, n.d.).
 
-The dataset includes **30,520 slices across 1,526 scans from 680 subjects** (459 NC and 221 AD subjects), labeled as NC = 0 and AD = 1. A file's prefix identifies a specific scan, not a person; a single subject can have multiple scans.
+The dataset includes **30,520 slices across 1,526 scans from 680 subjects** (459 NC and 221 AD subjects), labeled as NC = 0 and AD = 1. A file's prefix identifies a specific scan, not a person. A single subject can have multiple scans.
 
 My audit revealed that the original training and test folders shared **216 subjects**. As a result, previous scan-grouped results did not measure performance on unseen subjects. To fix this, I created the corrected `subject_70_15_15` split using metadata mappings. This guarantees that all scans and slices from a single person stay within one partition.
 
@@ -102,7 +113,7 @@ My audit revealed that the original training and test folders shared **216 subje
 | Test | 102 | 220 | 4,400 |
 | **Total** | **680** | **1,526** | **30,520** |
 
-My audit confirmed zero patient overlap across splits and verified that labels match the metadata. A diagnosis-stratified split sets aside 15% of subjects (rounded up) for validation and another 15% for testing. Total slice counts vary across splits because individual subjects have different numbers of scans.
+My audit found zero patient overlap across splits, and the labels matched the metadata. A diagnosis-stratified split sets aside 15% of subjects (rounded up) for validation and another 15% for testing. Total slice counts vary across splits because individual subjects have different numbers of scans.
 
 I built the dataset split in [dataset.py](dataset.py) using helper functions in [utils.py](utils.py). The private split manifest records the overall inventory and metadata hash, which I verify during evaluation.
 
@@ -185,7 +196,40 @@ I ran both models using identical training settings and subject splits. Validati
 
 **Primary metric:** Total correct predictions divided by all test slices. I also evaluated per-class precision/recall, macro-F1, and AUROC scores to analyze overall performance.
 
+**ROC and AUROC:** a receiver operating characteristic (ROC) curve plots
+AD sensitivity (true-positive rate) against the NC false-positive rate as
+the AD-probability threshold varies. AUROC summarizes this ranking across
+thresholds. A score of 0.5 represents chance ranking and 1.0 perfect separation.
+It is not accuracy at threshold 0.5, a confidence-calibration measure, or
+proof that the model meets the 80% accuracy requirement.
+
+The validation autopsy helper
+[`subject_autopsy.py`](../../development/convnext_adni/adni_experiments/subject_autopsy.py)
+implements ROC and precision-recall plotting and saves
+`validation_roc_pr_curves.png` in its chosen output directory. Experiment
+evaluators also report AUROC numerically. The verified checkpoint-selection
+ROC plot is shown in [Section 5.7](#57-checkpoint-selection-and-cached-gpu-augmentation).
+The standard `predict.py` command saves confusion/failure plots, not a ROC curve.
+
+The versioned `adni_validation_roc_v1.slurm` job replays only validation
+inference for both job-724703 checkpoint selections, with pinned checkpoint
+hashes and a ten-minute GPU cap. `evaluate_selection.py --roc_replay` checks
+replayed accuracy, macro-F1, AUROC and AD average precision against the saved
+comparison (absolute tolerance 1e-6) before plotting. It saves aggregate
+ROC coordinates and a PNG in a new job directory, without individual slice
+probabilities, retraining, threshold tuning or test inference.
+
+**ROC replay (job 725399):**
+ROC coordinates are finite, monotonically nondecreasing and span (0, 0) to
+(1, 1). The area under each curve matches the reported validation AUROC.
+The frozen test results are unchanged.
+
 ## 3. Classification results
+
+This section preserves the original CNN/scratch ConvNeXt benchmark.
+Its unmet accuracy targets are historical model-specific outcomes, not the
+latest project status. The regularized ConvNeXt subsequently reached
+**82.09% exploratory test accuracy**. See [Section 7.3](#73-completed-regularization-results-and-remaining-priorities).
 
 ### 3.1 Model training and checkpoint selection
 
@@ -353,7 +397,12 @@ In job 719040, I split the 102 validation subjects into 51 calibration subjects 
 1. **Probability quality worsened after scaling**. The Brier score measures squared probability error, NLL penalizes confident mistakes, and ECE measures agreement between predicted probabilities and real outcomes. All three scores worsened for both models on assessment, so I do not recommend using these fitted temperatures.
 2. **Classification results remained unchanged**. Assessment accuracy stayed at 77.52% for my CNN baseline and 77.96% for ConvNeXt. Because positive scalar temperature scaling preserves the original decision boundary at 0.5, it cannot recover missed Alzheimer's predictions at that threshold (Guo et al., 2017).
 
-In this experiment, ECE uses ten equal-width AD-probability bins rather than maximum-confidence bins.
+Temperature scaling fitted on validation data may not transfer reliably
+under distribution shift (Guo et al., 2017). Scanner acquisition imbalance
+is a concern here, but the observed calibration degradation does not prove
+that imbalance caused it. In this experiment, ECE measures P(AD) against
+AD frequency in ten equal-width probability bins. Guo et al. use maximum
+confidence across 15 bins. These ECE measurements are not directly equivalent.
 
 ![Raw and temperature-scaled AD-probability reliability curves on the validation assessment half](figures/calibration_assessment.png)
 
@@ -473,12 +522,17 @@ Neither architecture reaches the required release threshold, neither model quali
 - Both models still make serious classification errors even within the most well-represented scanner types.
 - The evidence does not justify removing difficult subjects, altering ground-truth labels, or treating high softmax confidence as an anatomical explanation.
 
-### 5.4 Why is accuracy below 80%, and what was tried?
+### 5.4 Why did the original models fall below 80%, and what was tried?
 
 To reach the 80% accuracy target on my test set of 4,400 slices, a model must correctly classify at least 3,520 slices. My frozen models fell short of this benchmark:
 
 - **CNN baseline**: Correctly predicted 3,335 slices, leaving a net shortfall of **185 correct predictions** (4.20 percentage points below target).
 - **ConvNeXt**: Correctly predicted 3,299 slices, leaving a net shortfall of **221 correct predictions** (5.02 percentage points below target).
+
+These shortfalls describe the original scratch models. The later regularized
+ConvNeXt achieved 3,612 correct slices (82.09%), exceeding the required
+3,520 by 92. [Section 7.3](#73-completed-regularization-results-and-remaining-priorities)
+reports that exploratory result and its limitations.
 
 **Core concerns: Data coverage and overfitting**
 - All normal scans in the dataset originate from 2017 or later, whereas most Alzheimer's scans are earlier. Subject-level splitting eliminates patient identity overlap across splits, but it cannot create missing earlier-era normal scans.
@@ -512,7 +566,7 @@ not replacements for the frozen test comparison.
 These are research checks, not an approved clinical operating procedure:
 
 1. **Acquisition gate:** eligibility requires at least 50 training scans of
-   each diagnosis in the acquisition group; other groups are routed to review.
+   each diagnosis in the acquisition group. Other groups are routed to review.
 2. **Confidence gate:** eligible groups use the validation-fixed confidence
    threshold.
 3. **Release check:** eligibility also requires at least 80% validation AD
@@ -558,6 +612,178 @@ I trained two ConvNeXt models using the same random seed (seed 42) and identical
 3. Overall metrics show mixed results such as Macro-F1 rose slightly, yet AUROC dropped. This shows that flips do not improve overall model performance.
 4. I kept horizontal flips turned off. My main goal is to improve accuracy without missing more Alzheimer's cases. Because flips reduced Alzheimer's recall, I kept flips disabled in my main pipeline.
 
+### 5.6 ImageNet initialization: accuracy versus AD detection
+
+I compared two ConvNeXt models to evaluate the impact of transfer learning: a model trained from scratch versus a model initialized with torchvision ImageNet-1K weights (Job 723091). Both models used random seed 42, the corrected subject split, fixed grayscale normalization, no horizontal flips, and the same training recipe.
+
+For the pretrained model, I summed the three RGB stem channels into a single grayscale input channel, attached a new two-class classification head, and fine-tuned all parameters. Scratch training completed in 33.82 minutes, and pretrained training completed in 26.80 minutes.
+
+| Validation measure | Fresh scratch | ImageNet initialization |
+|---|---:|---:|
+| Accuracy | 72.70% | **82.49%** |
+| NC recall | 71.02% | **91.02%** |
+| AD recall | **74.89%** | 71.29% |
+| Later-era accelerated AD recall | **63.16%** | 25.26% |
+| Macro-F1 | 0.7253 | **0.8170** |
+| AUROC | 0.7976 | **0.8905** |
+
+
+| Validation metric	| Fresh scratch |	ImageNet initialization |	Trade-off / Impact |
+|---|---:|---:|---:|
+| **Overall accuracy** | 72.70%	| **82.49%** | Large overall gain (+9.79%) |
+| **Normal (NC) recall** |	71.02% | **91.02%**	| Higher normal detection (+20.00%) |
+| **Alzheimer's (AD) recall**	| **74.89%** | 71.29%	| Lower disease detection (-3.60%) |
+| **Later-era accelerated AD recall**	| **63.16%** | 25.26%	| Severe drop in target subgroup (-37.90%) |
+| **Macro-F1 score** | 0.7253 | **0.8170** | Higher overall balance (+0.0917) |
+| **AUROC**	| 0.7976 | **0.8905**	| Higher ranking quality (+0.0929) |
+
+**Validation analysis and overfitting patterns** 
+- **Accuracy gains mask higher missed disease cases**: Pretraining added 488 correct normal predictions but lost 67 correct Alzheimer's predictions, giving a net gain of 421 correct slices.
+- **Subgroup performance collapsed**: In the critical later-era accelerated Alzheimer's group, correct detection dropped from 240/380 slices down to 96/380 slices. Pretraining failed to resolve the acquisition-era imbalance.
+- **Overfitting and overconfidence**: The pretrained model reached its peak validation accuracy at epoch 6. Training accuracy approached 100%, but validation loss rose from 0.5513 at epoch 1 to 1.0378 at epoch 6. This indicates that the network produced increasingly overconfident errors as training progressed.
+
+#### Frozen test evaluation
+
+I evaluated both validation-selected checkpoints on the frozen test set of 4,400 slices using the standard 0.5 threshold without temperature scaling or referral rules (Job 724514).
+
+| Test measure | Fresh scratch | ImageNet initialization | Description |
+|---|---:|---:|---:|
+| **Overall accuracy** | 74.98% | **79.55%** | Unmet (3,500/4,400 correct, 20 short of target) |
+| **NC recall** | 73.97% | **90.84%** | 361 more correct normal slices |
+| **AD recall** | **75.93%** | 68.85% | 160 more missed disease slices |
+| **Later-era accelerated AD recall** | **63.67%** | 27.00% | Drops from 191/300 to 81/300 slices |
+| **Macro-F1** | 0.7495 | **0.7939** | Higher macro balance |
+| **AUROC** | 0.8284 | **0.9170** | Better score ranking |
+| **AD average precision** | 0.8375 | **0.9182** | Higher precision ranking |
+
+The test confusion matrix for the ImageNet-initialized model contains 1,944 true normal predictions, 196 false alarms, 704 missed Alzheimer's cases, and 1,556 correct Alzheimer's predictions.
+
+**Decision**: I retained this result as a clear accuracy-versus-sensitivity trade-off rather than adopting it as a primary screening model. Even though validation accuracy exceeds 80%, the pretrained model fails the disease-recall safeguard by missing significantly more Alzheimer's cases.
+
+### 5.7 Checkpoint selection and cached GPU augmentation
+
+I evaluated fresh ImageNet-initialized ConvNeXt runs on 4,300 validation slices across 102 subjects. I compared CPU augmentation (Job 724532) against GPU-cached augmentation (Job 724703), while evaluating peak accuracy checkpoint selection versus lowest validation loss selection.
+
+| Validation measure | CPU accuracy selection | CPU loss selection | GPU accuracy selection | GPU loss selection |
+|---|---:|---:|---:|---:|
+| Job | 724532 | 724532 | 724703 | 724703 |
+| Selected epoch | 3 | 1 | 5 | 3 |
+| Overall accuracy | 83.05% | 76.88% | **84.00%** | 82.42% |
+| Correct / 4,300 slices | 3,571 | 3,306 | **3,612** | 3,544 |
+| NC recall | 85.70% | 68.93% | **87.79%** | 79.71% |
+| AD recall | 79.57% | **87.31%** | 79.03% | 85.97% |
+| Later-era accelerated AD recall | 48.42% | **67.63%** | 42.89% | 57.89% |
+| Macro-F1 | 0.8270 | 0.7688 | **0.8360** | 0.8230 |
+| AUROC | 0.8975 | 0.8773 | **0.9207** | 0.9027 |
+| Probability NLL (lower is better) | 0.7200 | **0.5703** | 0.6193 | 0.5733 |
+| Brier score (lower is better) | 0.1450 | 0.1691 | **0.1318** | 0.1406 |
+
+**Takeaways**
+- **Accuracy versus loss selection**: Within the GPU run, choosing the lowest validation loss checkpoint detects 129 more Alzheimer's slices than accuracy selection. It improves later-era Alzheimer's detection from 163/380 to 220/380 slices, but misses 197 more normal slices.
+- **Calibration disconnect**: Lower negative log-likelihood (NLL) does not guarantee better overall reliability, as the Brier score worsens under loss selection.
+- **Persistent subgroup weakness**: Despite achieving 84.00% aggregate validation accuracy under GPU accuracy selection, later-era Alzheimer's recall remains dangerously low at 42.89%.
+
+**Acquisition-era sampling evaluation**
+
+I tested whether sampling reweighting during training could fix the subgroup weakness (Job 725046). I configured training batches to sample 50% normal scans, 25% later-era Alzheimer's scans, and 25% earlier-era Alzheimer's scans.
+
+| Validation measure | GPU accuracy selection (724703) | Era accuracy selection (725046) | GPU loss selection (724703) | Era loss selection (725046) |
+|---|---:|---:|---:|---:|
+| Selected epoch | 5 | 3 | 3 | 1 |
+| Accuracy | 84.00% | 82.79% | 82.42% | 80.44% |
+| NC recall | 87.79% | 82.70% | 79.71% | 91.72% |
+| AD recall | 79.03% | 82.90% | 85.97% | 65.65% |
+| Later-era AD recall | 42.89% | 49.21% | 57.89% | 30.53% |
+| Macro-F1 | 0.8360 | 0.8258 | 0.8230 | 0.7928 |
+| AUROC | 0.9207 | 0.9092 | 0.9027 | 0.8910 |
+| Probability NLL | 0.6193 | 0.6440 | 0.5733 | 0.5967 |
+| Brier | 0.1318 | 0.1433 | 0.1406 | 0.1552 |
+
+Era accuracy selection gains 72 correct Alzheimer's slices (improving later-era recall from 163/380 to 187/380), but misses 124 more normal slices. Era loss selection performs significantly worse, missing 378 more Alzheimer's slices.
+
+**Decision**: Sampling reweighting alone changes training exposure without creating missing scanner examples. Because it fails to resolve the underlying data coverage deficit, I retained these findings strictly as validation trade-off studies.
+
+**Runtime smoke check** 
+I performed an execution smoke check on a Rangpur A100 GPU allocation (Job 724686). Repeated cached image loading generated identical feature tensors, and device augmentation produced valid output tensors of shape `[1, 1, 224, 224]`. Evaluating a single validation slice produced an output probability of `P(AD)=0.0244 (97.56% normal confidence)`, correctly demonstrating that pipeline referral rules execute as expected without runtime errors.
+
+#### Validation ROC replay
+
+I re-evaluated both checkpoint selection strategies from Job 724703 on the same 4,300 validation slices to compare their Receiver Operating Characteristic (ROC) curves (Replay Job 725399).
+
+![Validation ROC curves for accuracy-selected and loss-selected job-724703 checkpoints](figures/validation_roc.png)
+
+**Figure 10. Validation ROC curves for checkpoint selection strategies (Job 725399).** 
+- **Blue line (Accuracy selection)**: Achieves a higher overall ranking score with an AUROC of 0.9207.
+- **Orange line (Loss selection)**: Reaches a slightly lower overall ranking score with an AUROC of 0.9027[cite: 5].
+- **Dashed diagonal line**: Represents random chance ranking
+
+**Takeaways**
+- **A higher AUROC does not guarantee higher disease recall at every threshold**. Even though accuracy selection achieves higher overall score ranking, loss selection detects more Alzheimer's cases at the standard 0.5 decision threshold (85.97% versus 79.03% recall)
+- **ROC curves measure score ranking across all cutoffs**. An ROC curve summarizes score separation across every possible threshold. However, it does not measure probability calibration, guarantee clinical safety, or prove that a model hits the 80% test accuracy goal.
+
+### 5.8 Labelled validation predictions and confident errors
+
+I evaluated the job-724703 checkpoint on 12 validation slice examples from 12 distinct subjects, split evenly between six normal control (NC) cases and six Alzheimer's disease (AD) cases. Out of the 12 examples, ten predictions were correct and two were wrong.
+
+- **False positive error (Panel 4)**: A true normal slice predicted as Alzheimer's disease with 0.9178 confidence.
+- **False negative error (Panel 12)**: A true Alzheimer's disease slice predicted as normal with 0.8998 confidence.
+
+Because both error confidence scores exceeded the demonstration referral threshold of 0.80, the system failed to flag either error for human review and referred zero slices overall.
+
+![Twelve labelled validation predictions: ten correct predictions in green and two confident errors in red](figures/prediction_examples.png)
+
+**Figure 11. Labelled validation prediction examples (job-724703 checkpoint).**
+- Panels are arranged left-to-right and top-to-bottom. Each panel title displays the predicted class, confidence score rounded to three decimal places, and true ground-truth diagnosis.
+- **Correct predictions (Green)**: Ten panels show correct classifications. Displayed confidence scores of 1.000 reflect decimal rounding rather than absolute mathematical certainty.
+- **Confident errors (Red)**: Panel 4 displays a false positive (true NC predicted as AD with 0.918 confidence), while Panel 12 displays a false negative (true AD predicted as NC with 0.900 confidence).
+- **Referral failure**: No yellow referral markers appear because all predicted confidence values clear the 0.80 threshold line.
+
+**Takeaways**
+- **High confidence scores do not ensure diagnostic correctness**. Both incorrect predictions bypassed the confidence cutoff rule without triggering human review.
+
+Reproduction commands are in [Section 8.3](#83-inference-and-example-output).
+
+#### Grad-CAM as a supporting diagnostic
+
+I generated Grad-CAM feature heatmaps for the unregularized ConvNeXt checkpoint (job-724703) across the same 12 validation slice examples using train.py --save_validation_gradcam (Job 725543). This feature overlays gradient-weighted activations from the final convolutional stage for the predicted class.
+
+I scaled each heatmap individually for display, meaning color intensity reflects relative activation within a single image rather than an absolute score across slices. All 12 images produced valid, non-zero activation maps.
+
+![Predicted-class Grad-CAM overlays for the twelve labelled validation examples](figures/validation_gradcam.png)
+
+**Figure 12. Predicted-class Grad-CAM overlays for unregularized validation predictions (Job 725543)** 
+- Warm colors showing higher relative activation within each image, while cool colors show lower activation. Title text colors (green for correct, red for error) show classification outcome rather than heatmap quality.
+- Both confident errors—the false positive in Example 4 and the false negative in Example 12—display focused activation over brain tissue rather than empty background noise.
+- Several correct predictions, such as Examples 1 and 5, show activation extending beyond the skull boundary into background space.
+
+**Qualitative takeaways:** 
+
+Plausible heatmaps do not prove that a network has learned true anatomical biomarkers, nor do they explain why an error occurred. Confirming feature causality requires controlled occlusion tests rather than visual inspection alone. Grad-CAM aids qualitative failure analysis, but generating heatmaps does not improve accuracy or satisfy the 80% test benchmark.
+
+#### Current regularized model: matched validation predictions and Grad-CAM
+
+I evaluated the current regularized ConvNeXt model (epoch-2 checkpoint from Job 725521, which achieved 82.09% exploratory test accuracy) on the exact same 12 validation slices (Job 725687). All 12 saved heatmaps produced valid, non-zero activation maps.
+
+![Regularized model predictions on the same twelve validation examples, with eleven green accepted predictions and one yellow referral](figures/regularization_prediction_examples.png)
+
+**Figure 13. Labelled validation predictions for the current regularized model (Job 725687).** 
+
+- **All 12 class predictions are correct**. Eleven predictions clear the 0.80 confidence threshold and are accepted (green titles).
+- Example 4 changes from a confident false positive to a correct normal prediction (
+P(AD)=0.0617, or 93.83% normal confidence)
+- Example 12 (true Alzheimer's) changes from a confident false negative to a correct Alzheimer's prediction with `P(AD)=0.7181`. Because its confidence falls below the 0.80 threshold, the system flags it as REFER for human clinician review (yellow title)
+
+![Predicted-class Grad-CAM for the current regularized model on the same twelve validation examples](figures/regularization_validation_gradcam.png)
+
+**Figure 14. Predicted-class Grad-CAM overlays for the current regularized model (Job 725687).** 
+- All titles are green because **all underlying class predictions are correct**. 
+- Activations remain focused inside brain tissue, though some boundary spillover persists in Example 5.
+- Example 4 now highlights features driving the normal prediction, while Example 12 highlights features driving the Alzheimer's prediction. 
+
+**Takeaways** 
+
+Shifted target logits, updated model weights, and independent display scaling prevent attributing heatmap changes strictly to improved anatomical focus. These maps support qualitative comparisons across runs, but they do not provide causal proof of the measured accuracy gain.
+
 ## 6. Computational cost
 
 Numerical evidence: [resource profile and recorded environment](results/resource_profile.json).
@@ -589,23 +815,68 @@ I benchmarked the resource consumption of both trained models on the corrected v
 **To:** Project Manager, MRI Classification Research Prototype<br>
 **Subject:** Model selection and next-stage evaluation
 
-**Recomendation:** I recommend retaining the lightweight CNN baseline strictly as a research benchmark and not deploying either network for clinical screening. Neither model meets the 80.00% overall accuracy target, and neither error referral rule meets the 50% error referral target. While ConvNeXt provides slightly better score ranking, its 71.5-times larger parameter footprint and 3.45-times longer training duration yield lower decision-threshold accuracy and miss more Alzheimer's disease cases.
+**Recommendation:** retain the lightweight CNN as a research benchmark,
+not a clinical service. The original scratch ConvNeXt has lower test accuracy
+and AD recall than the CNN despite greater computational cost. ImageNet
+initialization initially raised test accuracy to 79.55%, but remained below 80% and
+reduces AD recall to 68.85%, with only 27.00% recall in later-era AD.
+Neither primary-model referral rule meets the 50% error-referral target.
+The subsequent regularized model reaches 82.09% exploratory test accuracy
+and 80.22% AD recall, but only 50.00% later-era AD recall. It is a research
+candidate for independent evaluation, not a validated screening service.
 
 #### Evidence supporting the decision
 
 1. **Classification performance**
-CNN test accuracy reaches 75.80% compared to 74.98% for ConvNeXt. Alzheimer's disease recall reaches 83.85% for the CNN baseline versus 75.93% for ConvNeXt. Neither model meets the 80.00% project goal, but the simple CNN is the stronger baseline at the standard 0.5 decision cutoff because it catches 179 more disease slices.
-2.**Score ranking quality**
-ConvNeXt achieves higher AUROC (0.8284 versus 0.8187) and PR-AUC (0.8375 versus 0.7724) than the CNN baseline. However, better probability ranking alone does not offset its lower threshold accuracy or its higher rate of missed disease cases.
+The current regularized ConvNeXt reaches **82.09% exploratory test accuracy**
+(3,612 / 4,400), meeting the numerical 80% target, with **80.22% AD recall**
+and **84.07% NC recall**. However, later-era AD recall is only **50.00%**:
+150 of 300 slices are missed. The original CNN/scratch comparison remains
+75.80% versus 74.98% accuracy, with higher AD recall for the CNN
+(83.85% versus 75.93%). Those historical results support retaining the CNN
+as a benchmark, not claiming it has higher accuracy than the current model.
+All follow-ups remain single-seed, same-cohort exploratory evidence.
+2. **Score ranking quality**
+The regularized model achieves test **AUROC 0.9159** and **AD average
+precision 0.9149**, substantially above the original scratch ConvNeXt
+(0.8284 and 0.8375). These are slightly below the initial pretrained
+model's 0.9170 and 0.9182 despite improved threshold accuracy and AD recall.
+Better aggregate ranking does not establish calibration or resolve the
+later-era disease-detection weakness.
 3. **Error referral routing**
-Fixed confidence rules refer only 35.12% of CNN errors and 31.52% of ConvNeXt errors to human review. Both models fall far short of the 50% project referral target, meaning accepted predictions cannot be assumed correct.
+Full-test referral measurements apply only to the original CNN and scratch
+ConvNeXt: their validation-fixed rules refer **35.12%** and **31.52%** of
+errors, below the 50% target. No full-cohort referral benefit has been
+established for the regularized model. Its matched 12-example validation
+demo has 12 correct predictions and one referral (Figure 13), but contains
+no errors from which to estimate error-referral performance. The
+demonstration threshold 0.80 is not a validated operating rule.
 4. **Calibration performance**
-Temperature scaling worsened Brier score, negative log-likelihood (NLL), and Expected Calibration Error (ECE) for both architectures on validation data. Positive scalar scaling preserves the original 0.5 decision boundary, so it cannot recover missed disease predictions at that threshold.
+The regularized accuracy-selected checkpoint has lower validation NLL
+(**0.5137 versus 0.6193**) and Brier score (**0.1233 versus 0.1318**) than
+the unregularized GPU control. This does not establish independent
+calibration or test probability quality. Temperature scaling worsened NLL,
+Brier and ECE on the original models' validation assessment half. Those
+findings are not measurements of the regularized model. Its temperature
+scaling and ECE have not been evaluated. Positive scalar scaling preserves
+the 0.5 decision boundary and cannot recover missed AD predictions there.
 5. **Computational overhead**
-ConvNeXt uses 71.5 times as many parameters, consumes nearly double the inference memory, and takes 3.45 times longer to train. This added resource cost brings no clear operational benefit.
+The regularized ConvNeXt retains **27,818,594 parameters**, 71.5 times the
+CNN's count. Its training-and-validation job completed in **25m 46s**, within
+the two-hour cap. Section 6's memory and latency measurements describe
+the original models, not a new profile of cached GPU augmentation or the
+regularized checkpoint. Different stopping epochs and timing scopes
+prevent claiming a speedup from whole-job durations. The current model's
+accuracy gain makes it a research candidate, but does not establish a
+safe operational benefit given subgroup failures and unassessed
+full-cohort referral performance.
 
 #### Recommended actions
 
+- Preserve the initial pretrained comparison (Section 5.6) and the later
+  regularized result (Section 7.3): 82.09% meets the numerical accuracy
+  target, but prior test exposure and 50.00% later-era AD recall require
+  independent evaluation before broader claims.
 - Keep the CNN baseline strictly as an experimental benchmark, not a clinical tool.
 - Do not deploy raw or scaled confidence scores to make automated diagnostic decisions.
 - Shift future checkpoint selection from peak validation accuracy to validation NLL or ECE.
@@ -620,35 +891,197 @@ Before any future candidate can be considered for clinical evaluation, I require
 - **Reliable error referral**: Prove that a validation-selected review rule achieves at least 80% scan coverage and routes at least 50% of errors to human review on unseen data.
 - **Multi-seed repeatability**: Confirm performance across multiple training seeds and independent patient cohorts using a fixed preprocessing setup.
 
-### 7.3 Prioritized improvement plan 
+### 7.3 Completed regularization results and remaining priorities
 
-These findings motivate targeted experiments focused on data coverage and decision stability. I have structured the next technical steps in order of priority:
+I tested stronger regularization because the initial pretrained model
+reached **79.55% test accuracy** but still missed many AD slices.
+Its normal recall was 90.84%, compared with 68.85% AD recall and only
+27.00% recall on newer AD scans. Training accuracy approached 100%
+while validation loss increased, suggesting that the model was overfitting.
+Separating subjects prevented patient overlap, but did not remove the
+imbalance between diagnosis and scanner era.
 
-1. **Data coverage audit**
-Perform a comprehensive site and scanner audit to collect balanced normal and disease scans across all acquisition eras. Sampling reweighting alone cannot replace missing data points.
+The published ConvNeXt recipe includes stochastic depth alongside longer
+ImageNet training, large batches and exponential moving average
+(Liu et al., 2022). I used this as motivation to test regularization,
+rather than assuming ImageNet weights alone would solve the problem.
+My experiment did not reproduce the paper's full training recipe.
 
-2. **Single-factor generalization study**
-Evaluate stochastic depth (drop_path_rate = 0.1) on ConvNeXt in a controlled single-factor experiment on the corrected subject split.
+**Training changes**
 
-3. **Multi-slice consensus rules**
-Develop a scan-level decision rule that aggregates predictions across multiple slices per patient scan to improve individual decision stability.
+I compared the regularized model (job 725521) with the pretrained GPU
+model without regularization (job 724703):
 
-4. **Calibration-driven checkpoint selection**
-Use validation NLL or ECE rather than peak validation accuracy to select saved checkpoint weights during training runs.
+- **Drop-path:** increased from 0 to a maximum of **0.10**.
+- **Head dropout:** increased from 0 to **0.20**.
+- **Unchanged settings:** the subject split, GPU augmentation, fixed normalization, optimizer and no era-balanced sampling.
+- **Checkpoint selection:** I saved the best-accuracy and lowest-loss checkpoints while keeping accuracy-based early stopping.
 
-5. **External cohort evaluation**
-Reserve final evaluation for an authorized independent patient cohort, keeping all preprocessing and model hyperparameter choices frozen in advance.
+The run took 25m 46s. Both selection rules chose epoch 2 with the same
+weights. Dropout and stochastic depth were disabled during evaluation.
 
-Candidate rejection criteria include increased false negatives for Alzheimer's disease, resource budget overruns, or reliance on test set retuning.
+![Saved training and validation loss and accuracy curves for the current regularized ConvNeXt](figures/regularization_training_curves.png)
 
-### 7.4 Insights from reference literature
+**Figure 15. Current regularized ConvNeXt training curves (job 725521).**
+The model performed best on validation at epoch 2. Training continued
+to epoch 8, but later epochs did not improve validation accuracy.
 
-**1. ConvNeXt training setup (Liu et al., 2022)**
-The published ConvNeXt setup relies on 300 epochs of ImageNet pretraining, a batch size of 4,096, a learning rate of 4e-3, stochastic depth, and exponential moving average (EMA) tracking. My short batch-8 training runs from scratch did not reproduce these conditions. Testing stochastic depth (drop_path_rate = 0.1) represents the most direct architecture experiment to run next.
-**2. Probability calibration limits (Guo et al., 2017)**
-Temperature scaling assumes that training and evaluation datasets share matching underlying distributions. Scanner acquisition imbalances in this dataset violate that assumption, causing temperature scaling to degrade probability calibration. Additionally, my implemented ECE measures P(AD) against AD frequency across ten equal-width bins, whereas Guo et al. bin maximum confidence across 15 bins.
+- **Selected epoch 2:** validation accuracy was **84.65%** and loss was **0.5137**.
+- **Final epoch 8:** training accuracy reached **99.21%**, while validation accuracy was **82.91%** and loss was **0.7183**.
+- **Interpretation:** the growing training/validation gap suggests that overfitting remained. I used epoch 2, not the final epoch, for testing.
 
-### 7.5 Important limitations
+| Validation measure | Job 724703 accuracy selection | Regularized epoch 2 |
+|---|---:|---:|
+| Overall accuracy | 84.00% | 84.65% |
+| NC recall | 87.79% | 85.57% |
+| AD recall | 79.03% | 83.44% |
+| Later-era AD recall | 42.89% | 55.00% |
+| Macro-F1 | 0.8360 | 0.8441 |
+| AUROC | 0.9207 | 0.9201 |
+| Probability NLL | 0.6193 | 0.5137 |
+| Brier | 0.1318 | 0.1233 |
+
+**Validation findings**
+
+- The regularized model correctly classified **82 more AD slices** but **54 fewer normal slices**, giving a net gain of **28 correct predictions**.
+- It detected **46 more of the 380 newer AD slices**, although recall remained below the proposed 80% subgroup target.
+- Lower NLL and Brier score showed lower probability error on validation, but did not establish performance on the test set.
+
+**Test results**
+
+I then evaluated the selected epoch-2 model on all **4,400 test slices**
+(job 725645). I kept the decision threshold at 0.5 without temperature
+scaling or excluding uncertain predictions. The table compares this model
+with the initial pretrained model.
+
+| Test measure | Initial pretrained (723091) | Regularized (725521) |
+|---|---:|---:|
+| Overall accuracy | 79.55% | **82.09%** |
+| Correct / 4,400 slices | 3,500 | **3,612** |
+| NC recall | 90.84% | 84.07% |
+| AD recall | 68.85% | **80.22%** |
+| Later-era AD recall | 27.00% | **50.00%** |
+| Macro-F1 | 0.7939 | **0.8209** |
+| AUROC | 0.9170 | 0.9159 |
+| AD average precision | 0.9182 | 0.9149 |
+
+The regularized model reached **82.09% accuracy**, meeting the numerical
+80% target. Compared with initial pretraining:
+
+- **Overall:** 3,612 slices were correct, which is **92 above** the 3,520 required.
+- **AD detection:** 257 more AD slices were correct.
+- **Normal detection:** 145 fewer normal slices were correct.
+- **Newer AD scans:** correct predictions increased from **81 to 150 out of 300**, but half were still missed.
+
+The gain in AD detection outweighed the loss in normal detection.
+However, this test used one training seed and a cohort I had already
+examined. It does not establish independent performance or show that
+regularization alone caused the improvement. Referral and calibration
+benefits were not measured in this test.
+
+![Current regularized ConvNeXt frozen exploratory test confusion matrix showing 1799 correct NC, 341 false positives, 447 false negatives and 1813 correct AD slices](figures/regularization_test_confusion_matrix.png)
+
+**Figure 16. Regularized ConvNeXt test confusion matrix (job 725645).**
+Rows show the true class and columns show the predicted class.
+
+- **Correct predictions:** 1,799 normal slices and 1,813 AD slices.
+- **False positives:** 341 normal slices were predicted as AD.
+- **False negatives:** 447 AD slices were predicted as normal.
+
+The diagonal gives **3,612 correct predictions (82.09%)**. The model
+exceeded the accuracy target, but the remaining missed AD slices show
+why this score alone is not enough to support clinical screening.
+
+#### How the model crossed the 80% target
+
+My ConvNeXt test accuracy increased from **74.98% to 79.55%, then to
+82.09%** after the training changes described below. I evaluated each
+model on the same 4,400 test slices, using a decision threshold of 0.5
+without temperature scaling or excluding uncertain predictions.
+
+| ConvNeXt model | Correct test slices | Test accuracy | Difference from the 80% target |
+|---|---:|---:|---|
+| Scratch control, job 723091 | 3,299 | 74.98% | 221 short |
+| Initial ImageNet initialization, job 723091 | 3,500 | 79.55% | 20 short |
+| Regularized pretrained model, job 725521 | 3,612 | **82.09%** | **92 above** |
+
+**Initial improvement with pretraining**
+
+I first used ImageNet weights instead of training ConvNeXt entirely from
+scratch. This raised test accuracy from 74.98% to 79.55%, but the model
+was still 20 correct predictions short of the target. It correctly
+classified 361 more normal slices but 160 fewer AD slices. This means
+the accuracy gain mainly came from recognising normal cases better,
+not from improving disease detection. Recall on newer AD scans fell
+to 27.00%.
+
+The training curves also showed a growing gap between training and
+validation performance. Together with the scanner-era imbalance, this
+suggested overfitting and uneven disease detection, although it did not
+prove the cause of the errors. I tested a lower learning rate,
+training-derived normalization and balanced sampling, but these changes
+did not consistently improve AD recall.
+
+**Adding regularization**
+
+For the final model, I made the following training choices:
+
+- **Starting weights and data:** I kept ImageNet initialization and the same subject split.
+- **Augmentation:** I used GPU augmentation without horizontal flips.
+- **Regularization:** I added maximum drop-path at **0.10** and head dropout at **0.20**.
+- **Checkpoint selection:** I selected **epoch 2**, which had both the highest validation accuracy and lowest validation loss.
+
+Drop-path and dropout randomly disable
+some residual paths or classification features during training to reduce
+reliance on particular features. Stochastic depth is also part of the
+published ConvNeXt training recipe (Liu et al., 2022), although the paper
+does not establish the best rates for this MRI dataset.
+
+Compared with the GPU model without regularization:
+
+- **AD recall** increased from **79.03% to 83.44%** on validation.
+- **Recall on newer AD scans** increased from **42.89% to 55.00%**.
+- **Correct validation predictions** increased by **28 slices**.
+- **NLL and Brier score** decreased, indicating lower probability error on validation.
+
+Image caching reduced repeated decoding rather than changing the classification task.
+
+**How this reached the target**
+
+The final model correctly classified **3,612 test slices**, compared with
+3,500 for the initial pretrained model. The change included:
+
+- **257 more correct AD predictions**.
+- **145 fewer correct normal predictions**.
+- A net gain of **112 correct slices**, raising accuracy by **2.55 percentage points to 82.09%**.
+- **92 correct predictions above** the 3,520 needed for the 80% target.
+
+The improvement therefore came with a trade-off: better AD detection
+but lower normal recall.
+
+**Remaining limitations**
+
+- **Newer AD scans:** the final model still missed half of these slices.
+- **Overfitting:** Figure 15 shows that the training/validation gap continued to grow after epoch 2.
+- **Effect of each change:** the pretrained test models used different augmentation implementations and selected epochs. I did not test the GPU model without regularization, so I cannot separate dropout's effect from the other training changes.
+- **Earlier test exposure:** the result meets the numerical target, but the test cohort had already been used in earlier experiments.
+
+Testing on new subjects and repeating training with different seeds would
+give stronger evidence that the improvement transfers beyond this experiment.
+
+Longer-term priorities are:
+
+1. **Improve acquisition coverage:** obtain permitted data with both diagnoses
+   represented across acquisition eras and sequences.
+2. **Evaluate on independent subjects:** freeze preprocessing, model selection
+   and decision rules before using an authorized independent cohort.
+3. **Assess patient-level workflow:** only after adequate slice-level
+   performance, evaluate scan-level aggregation and specialist review.
+
+These priorities focus on reducing missed AD cases within the resource
+budget, rather than repeatedly tuning against known test results.
+
+### 7.4 Important limitations
 
 - **Prior test set exposure**: Same-cohort testing history limits broader generalization claims.
 - **Single random seed**: Reported results reflect single training runs without multi-seed variance bounds.
@@ -664,13 +1097,13 @@ Added architectural complexity has not demonstrated an operational benefit in th
 ```text
 recognition/ConvNeXt_ADNI_s5022035/
 |-- README.md       Report, results and reproduction commands
-|-- modules.py      PyTorch-only CNN and ConvNeXt architectures
-|-- dataset.py      Image transforms and subject-disjoint data loading
-|-- train.py        Training, validation, checkpoints and learning curves
-|-- predict.py      Checkpoint loading, evaluation and failure plots
-|-- utils.py        Identity checks, acquisition parsing and sampling helpers
-|-- figures/        Five quantitative plots and four approved MRI contact sheets
-`-- results/        Nine aggregate JSON evidence files
+|-- modules.py      CNN and ConvNeXt models
+|-- dataset.py      Preprocessing and subject splits
+|-- train.py        Training and checkpoint saving
+|-- predict.py      Predictions and evaluation
+|-- utils.py        Data checks and sampling helpers
+|-- figures/        Report figures
+`-- results/        Aggregate results
 ```
 
 The repository includes aggregate results and report figures. Restricted
@@ -678,9 +1111,7 @@ datasets, model weights and subject-level records are stored separately.
 
 ### 8.2 Environment and data
 
-The reported GPU experiments ran on **UQ Rangpur**, using the existing
-`comp3710` virtual environment inside Slurm GPU allocations. The recorded
-dependencies are:
+I ran the GPU experiments on **UQ Rangpur** in the `comp3710` environment.
 
 | Package | Version |
 |---|---|
@@ -693,14 +1124,12 @@ dependencies are:
 | Pillow | 12.3.0 |
 | Matplotlib | 3.11.2 |
 
-Package versions come from training jobs 717634 and 717690. Audit 718436
-recorded Python, CUDA **11.8** and cuDNN **9.1.0**.
-Activate the existing environment inside a Rangpur GPU allocation:
+The recorded environment uses CUDA **11.8** and cuDNN **9.1.0**.
+Inside a GPU allocation:
 
 ```bash
 cd ~/PatternAnalysis-2026/recognition/ConvNeXt_ADNI_s5022035
 source ~/venvs/comp3710/bin/activate
-python -c "import torch; print(torch.__version__); print('CUDA available:', torch.cuda.is_available())"
 ```
 
 Training and evaluation use the course-provided data:
@@ -720,41 +1149,32 @@ and is required for subject-disjoint splitting.
 
 ### 8.3 Inference and example output
 
-Evaluation requires the saved checkpoint, matching configuration and split
-manifest. Input slices are converted to grayscale tensors of shape
-`[B, 1, 224, 224]`. The model returns two scores per slice, in **NC, AD**
-order. Run:
+Prediction uses the saved checkpoint and its matching configuration.
+Input images become grayscale tensors of shape `[B, 1, 224, 224]`.
+The output classes are **NC and AD**. A labelled validation example is:
 
 ```bash
-python predict.py \
-  --model convnext --convnext_variant paper_tiny \
-  --checkpoint ./checkpoints/subject_paper_tiny_seed42_717690/best_convnext_paper_tiny_model.pt \
-  --data_dir /home/groups/comp3710/ADNI/AD_NC \
-  --metadata_path /home/groups/comp3710/ADNI/meta_data_with_label.json \
-  --split_protocol subject_70_15_15 --seed 42 \
-  --results_dir ./results/authorized_demo
+python predict.py --model convnext --convnext_variant paper_tiny \
+  --checkpoint ./checkpoints/regularization_v1_seed42_725521/best_convnext_paper_tiny_model.pt \
+  --images /path/to/known_NC.jpeg /path/to/known_AD.jpeg \
+  --true_labels NC AD --referral_threshold 0.80 \
+  --results_dir /path/to/new_private_labelled_demo
 ```
 
-The command loads checkpoint-specific normalization, checks the split and
-prints class metrics. It saves a confusion matrix and, when errors exist,
-a failure-case plot in the output directory. Failure plots contain restricted
-MRI data and identifiers.
+Replace the image paths with validation images and use their metadata
+labels. Omit `--true_labels` if the labels are unknown. The command saves
+prediction JSON and labelled images in a new output directory without
+evaluating the test split.
 
-Example metrics from the saved ConvNeXt test results:
-
-```text
-              precision    recall  f1-score   support
-          NC     0.7442    0.7397    0.7420      2140
-          AD     0.7549    0.7593    0.7571      2260
-    accuracy                         0.7498      4400
-```
-
-Figure 2 shows the confusion matrix; Figures 5-8 show validation failures.
+Green means correct, red means wrong and yellow means referred.
+The example threshold 0.80 is not a validated clinical rule.
+Current-model predictions and Grad-CAM are shown in Figures 13-14.
+Their reproduction script is
+[`adni_regularization_gradcam_v1.slurm`](../../development/convnext_adni/slurm/adni_regularization_gradcam_v1.slurm).
 
 ### 8.4 Training
 
-Inside a GPU allocation, use the following explicit settings to reproduce
-the main ConvNeXt training recipe:
+The current regularized ConvNeXt uses this training recipe inside a GPU allocation:
 
 ```bash
 python train.py \
@@ -764,29 +1184,42 @@ python train.py \
   --data_dir /home/groups/comp3710/ADNI/AD_NC \
   --seed 42 --epochs 40 --batch_size 8 --lr 5e-5 --weight_decay 0.05 \
   --patience 6 --loss cross_entropy --label_smoothing 0 \
-  --drop_path_rate 0 --head_dropout 0 --layer_scale_init 1e-6 \
+  --initialization imagenet --drop_path_rate 0.1 --head_dropout 0.2 --layer_scale_init 1e-6 \
   --normalization fixed --augmentation standard --skip_test \
-  --save_dir ./checkpoints/convnext_reproduction
+  --gpu_augmentation --cache_dir /path/to/private/cache --save_best_val_loss \
+  --save_dir ./checkpoints/regularized_reproduction
 ```
 
-Use a new output directory. `--skip_test` limits training to training and
-validation data. For the CNN, change `--model convnext` to `--model baseline`
-and use a separate output directory. For the flip experiment, change
-`--augmentation standard` to `--augmentation standard_flip`.
-The `paper_tiny` identifier selects the main ConvNeXt architecture.
+The cache path and output directory are new private locations.
+`--skip_test` limits the run to training and validation.
+Both checkpoint criteria selected epoch 2 in the reported experiment.
+
+The original scratch comparison uses the settings in Section 2.4.
+For scratch ConvNeXt, omit the ImageNet, GPU augmentation, cache and
+additional checkpoint flags, and set both dropout rates to zero.
+For the CNN baseline, also change `--model convnext` to `--model baseline`.
 
 ### 8.5 Reproducibility
 
-- **Fixed protocol:** both main models use seed 42, the same subject split
-  and the settings in Section 2.4.
+- **Fixed protocol:** seed 42 and the corrected subject split. The current
+  model's frozen test uses threshold 0.5, temperature 1 and no rejection.
 - **Saved records:** checkpoints, configurations, split manifests and
-  training histories preserve each run's settings and outcomes. Frozen
-  evaluation checks model and data fingerprints.
-- **Software checks:** 88 automated tests passed, covering subject
-  separation, metrics, normalization and training-only flips. Runtime and
-  job-script syntax checks also passed.
+  training histories preserve each run's settings and outcomes.
+- **Software checks:** automated tests cover subject separation, metrics,
+  normalization, augmentation and checkpoint loading. CUDA runtime checks
+  were performed on Rangpur.
 - **Numerical variation:** CUDA operations were not forced deterministic,
   so reruns can differ despite using the same seed.
+
+The frozen test script is
+[`adni_regularization_test_v1.slurm`](../../development/convnext_adni/slurm/adni_regularization_test_v1.slurm).
+Figures 15-16 can be regenerated from saved outputs without inference:
+
+```bash
+python development/convnext_adni/render_report_figures.py --regularization-only
+```
+
+This figure command runs from the repository root.
 
 ## 9. References and AI disclosure
 
@@ -826,11 +1259,4 @@ Torchvision documentation.
 
 ### Artificial Intelligence Usage Disclosure
 
-During this project, I utilized GitHub Copilot (powered by GPT-6 Luna)
-as an assistive tool for brainstorming, conducting audits, debugging
-code, and helping guidelines testing. The tool provided advice on model
-setup, flagged potential bugs that I independently cross-examined, and
-assisted in writing and proofreading this README. While Copilot
-provided structural support and code optimization suggestions, I
-independently wrote all core code such as the model development,
-preprocessing, data collection, and result
+During this project, I utilized GitHub Copilot (powered by GPT-6 Luna) as an assistive tool for brainstorming, conducting audits, debugging code, and helping guidelines testing. The tool provided advice on model setup, flagged potential bugs that I independently cross-examined, and assisted in writing and proofreading this README. While Copilot provided structural support and code optimization suggestions, I independently wrote all core code such as the model development, preprocessing, data collection, and result

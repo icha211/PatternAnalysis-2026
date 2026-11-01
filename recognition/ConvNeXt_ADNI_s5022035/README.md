@@ -29,7 +29,6 @@ exposure and this subgroup weakness do not justify clinical screening.
 | Assignment target: at least 80% overall test accuracy | **Met numerically by the regularized exploratory test** (3,612 / 4,400). The test cohort had been used in earlier experiments |
 | Confidence-based referral | Both primary-model rules retain over 80% of slices but refer fewer than 36% of errors |
 | Cost of ConvNeXt | 71.5 times as many parameters and 3.45 times the observed training time |
-| Recommendation | Keep the CNN as research baseline. **Do not use either model for automated diagnosis** |
 
 
 ## Contents
@@ -44,12 +43,7 @@ exposure and this subgroup weakness do not justify clinical screening.
 8. [Reproduction](#8-reproduction)
 9. [References and AI disclosure](#9-references-and-ai-disclosure)
 
-Results describe **slices, not patient diagnoses**, unless explicitly labelled
-otherwise. NC is the dataset's name for the normal class
-(called CN in the assignment).
-
 ## 1. Feasibility review
-
 
 ### 1.1 Intended use and success criteria
 
@@ -334,7 +328,7 @@ My evaluation framework separates each model's output into two distinct decision
 
 A slice is accepted for automated reporting when its confidence reaches a chosen threshold, dispite that it is flagged for expert review.
 
-| Term | Mathematical definition | Practical meaning |
+| Term | Definition |
 |---|---|
 | Coverage | Accepted slices / Total evaluated slices |
 | Accepted accuracy | Correct accepted slices / Total accepted slices |

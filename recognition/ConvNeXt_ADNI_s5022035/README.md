@@ -1059,17 +1059,11 @@ but lower normal recall.
 Testing on new subjects and repeating training with different seeds would
 give stronger evidence that the improvement transfers beyond this experiment.
 
-Longer-term priorities are:
+**Future research**:
 
-1. **Improve acquisition coverage:** obtain permitted data with both diagnoses
-   represented across acquisition eras and sequences.
-2. **Evaluate on independent subjects:** freeze preprocessing, model selection
-   and decision rules before using an authorized independent cohort.
-3. **Assess patient-level workflow:** only after adequate slice-level
-   performance, evaluate scan-level aggregation and specialist review.
-
-These priorities focus on reducing missed AD cases within the resource
-budget, rather than repeatedly tuning against known test results.
+1. Collect more balanced MRI data, with both normal and AD scans from different scanners and time periods.
+2. Test the model on a new group of patients without changing its settings based on their results.
+3. Check whether combining slices from the same scan improves predictions, rather than evaluate each slice separately.
 
 ### 7.4 Important limitations
 
@@ -1077,8 +1071,6 @@ budget, rather than repeatedly tuning against known test results.
 - **Single random seed**: Reported results reflect single training runs without multi-seed variance bounds.
 - **2D slice inputs**: Slice-level predictions do not constitute a full 3D patient-level diagnostic workflow.
 - **Data confounding**: Scan acquisition era and imaging sequence remain heavily correlated with disease diagnosis labels.
-
-Added architectural complexity has not demonstrated an operational benefit in this project. Expanding data coverage and evaluating on independent cohorts are far more defensible next steps than assuming high model confidence or higher validation accuracy establishes clinical safety.
 
 ## 8. Reproduction
 

@@ -203,11 +203,7 @@ thresholds. A score of 0.5 represents chance ranking and 1.0 perfect separation.
 It is not accuracy at threshold 0.5, a confidence-calibration measure, or
 proof that the model meets the 80% accuracy requirement.
 
-The validation autopsy helper
-[`subject_autopsy.py`](../../development/convnext_adni/adni_experiments/subject_autopsy.py)
-implements ROC and precision-recall plotting and saves
-`validation_roc_pr_curves.png` in its chosen output directory. Experiment
-evaluators also report AUROC numerically. The verified checkpoint-selection
+Experiment evaluators report AUROC numerically. The checkpoint-selection
 ROC plot is shown in [Section 5.7](#57-checkpoint-selection-and-cached-gpu-augmentation).
 The standard `predict.py` command saves confusion/failure plots, not a ROC curve.
 
@@ -1169,8 +1165,6 @@ evaluating the test split.
 Green means correct, red means wrong and yellow means referred.
 The example threshold 0.80 is not a validated clinical rule.
 Current-model predictions and Grad-CAM are shown in Figures 13-14.
-Their reproduction script is
-[`adni_regularization_gradcam_v1.slurm`](../../development/convnext_adni/slurm/adni_regularization_gradcam_v1.slurm).
 
 ### 8.4 Training
 
@@ -1210,16 +1204,6 @@ For the CNN baseline, also change `--model convnext` to `--model baseline`.
   were performed on Rangpur.
 - **Numerical variation:** CUDA operations were not forced deterministic,
   so reruns can differ despite using the same seed.
-
-The frozen test script is
-[`adni_regularization_test_v1.slurm`](../../development/convnext_adni/slurm/adni_regularization_test_v1.slurm).
-Figures 15-16 can be regenerated from saved outputs without inference:
-
-```bash
-python development/convnext_adni/render_report_figures.py --regularization-only
-```
-
-This figure command runs from the repository root.
 
 ## 9. References and AI disclosure
 
